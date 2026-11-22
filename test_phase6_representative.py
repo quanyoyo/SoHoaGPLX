@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -51,6 +52,24 @@ def make_dummy_pdf(path, pages_data):
             p_info["draw_func"](draw)
         images.append(img)
     images[0].save(path, save_all=True, append_images=images[1:], resolution=100)
+
+
+_DB_PATCH = None
+
+
+def setUpModule():
+    """Saves write to the shared database; keep test records out of the real one."""
+    global _DB_PATCH
+    from unittest.mock import patch
+    from src.database import DatabaseManager
+    work = tempfile.mkdtemp(prefix="gplx-p6-db-")
+    _DB_PATCH = patch("src.pipeline.DatabaseManager",
+                      return_value=DatabaseManager(os.path.join(work, "test.db"), files_root=work))
+    _DB_PATCH.start()
+
+
+def tearDownModule():
+    _DB_PATCH.stop()
 
 
 class Phase6RepresentativeDossiersTest(unittest.TestCase):
@@ -175,7 +194,7 @@ class Phase6RepresentativeDossiersTest(unittest.TestCase):
             ws = wb.active
             rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[1]]
             target = [r for r in rows if r[3] == "15.368.25.09.2015"][0]
-            self.assertEqual(target[2], "25/09/2015")
+            self.assertEqual(target[2], datetime(2015, 9, 25))
             self.assertEqual(target[7], 45)
         finally:
             wb.close()
@@ -229,7 +248,7 @@ class Phase6RepresentativeDossiersTest(unittest.TestCase):
             ws = wb.active
             rows = [r for r in ws.iter_rows(min_row=3, values_only=True) if r[1]]
             target = [r for r in rows if r[3] == "15.3081.01.03.2025"][0]
-            self.assertEqual(target[2], "01/03/2025")
+            self.assertEqual(target[2], datetime(2025, 3, 1))
         finally:
             wb.close()
 

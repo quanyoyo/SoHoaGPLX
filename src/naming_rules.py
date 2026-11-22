@@ -40,7 +40,7 @@ def normalize_license_code(raw_code: str) -> str:
     Normalizes a license code:
     E.g.: 'A 161541' -> 'A161541'
           'c244138'  -> 'C244138'
-          'A461S44-' -> 'A161541'
+          'A461S44-' -> 'A461544'  (S read as 5, trailing '-' dropped)
     """
     if not raw_code:
         return "UNKNOWN"
@@ -91,6 +91,34 @@ def _read_date(value: str, field: str, label: str, errors: dict[str, str]) -> da
     return None
 
 
+EXAM_DATE_FORMAT = re.compile(r"([0-9]{2})-([0-9]{2})-([0-9]{4})")
+
+
+def format_exam_date(value: str) -> str:
+    """An exam date read by the machine, written dd-mm-yyyy; a value that is not a real date is kept as read."""
+    parsed = _read_date(value, "exam_date", "", {}) if value.strip() else None
+    return f"{parsed.day:02d}-{parsed.month:02d}-{parsed.year:04d}" if parsed else value
+
+
+def typed_format_errors(*, group: str | None, exam_date: str = "", first_license_no: str = "",
+                        last_license_no: str = "") -> dict[str, str]:
+    """Checks on what the user typed in the review panel, stricter than the naming rules.
+
+    The naming rules accept other date separators, spaces and lower case, for values read by the
+    machine (quick rename). A typed exam date must be dd-mm-yyyy and the SQL endpoints upper case.
+    Empty boxes are left to the naming rules.
+    """
+    errors = {}
+    match = EXAM_DATE_FORMAT.fullmatch(exam_date.strip())
+    if exam_date.strip() and not (match and _read_date(exam_date, "exam_date", "", {})):
+        errors["exam_date"] = "Ngày thi/sát hạch phải là ngày có thật, nhập dạng dd-mm-yyyy (ví dụ 29-03-1996)."
+    if group == "SQL":
+        for field, label, value in (("first_license_no", "đầu", first_license_no), ("last_license_no", "cuối", last_license_no)):
+            if value.strip() and not LICENSE_NUMBER.fullmatch(value.strip()):
+                errors[field] = f"Số GPLX {label} phải viết hoa, gồm 1–2 chữ cái và 6 chữ số liền nhau (ví dụ AM570000)."
+    return errors
+
+
 def propose_dossier_filename(
     *,
     province_code: str = "",
@@ -108,7 +136,10 @@ def propose_dossier_filename(
     errors = {}
     code = province_code.strip()
     if not code:
-        errors["province_code"] = "Chưa chọn mã tỉnh lưu trữ."
+        # The OCR hint is named only when OCR read a province on the document.
+        hint = next((p for p in PROVINCE_CODES if p["code"] == suggested_province_code.strip()), None)
+        errors["province_code"] = (f"Chưa chọn mã tỉnh lưu trữ (OCR gợi ý: {hint['code']} – {hint['name']})."
+                                   if hint else "Chưa chọn mã tỉnh lưu trữ.")
     elif not re.fullmatch(r"[0-9]{2}", code) or not any(p["code"] == code for p in PROVINCE_CODES):
         errors["province_code"] = "Mã tỉnh không có trong danh mục cấu hình."
     elif suggested_province_code and suggested_province_code != code and not province_confirmed:

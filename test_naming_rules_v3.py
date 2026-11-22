@@ -1,7 +1,7 @@
 import unittest
 
 from src.cover_parser import parse_cover_page_text
-from src.naming_rules import is_valid_windows_filename_stem, propose_dossier_filename
+from src.naming_rules import format_exam_date, is_valid_windows_filename_stem, propose_dossier_filename, typed_format_errors
 
 
 class NamingRulesV3Test(unittest.TestCase):
@@ -36,6 +36,36 @@ class NamingRulesV3Test(unittest.TestCase):
         self.assertIsNone(proposal.filename)
         fields["decision_date"] = "31/09/2015"
         self.assertIn("decision_date", propose_dossier_filename(**fields, confirmed_group="QĐTT").errors)
+
+    def test_missing_province_names_the_ocr_suggestion_only_when_there_is_one(self):
+        fields = dict(exam_date="01/03/2025", decision_number="3081")
+        self.assertEqual(propose_dossier_filename(**fields, suggested_province_code="15").errors["province_code"],
+                         "Chưa chọn mã tỉnh lưu trữ (OCR gợi ý: 15 – Tỉnh Lào Cai).")
+        self.assertEqual(propose_dossier_filename(**fields).errors["province_code"], "Chưa chọn mã tỉnh lưu trữ.")
+
+    def test_exam_dates_read_by_the_machine_are_written_dd_mm_yyyy(self):
+        for value, expected in (("15/09/2015", "15-09-2015"), ("1/3/2025", "01-03-2025"),
+                                ("29 - 03 - 1996", "29-03-1996"), ("29-03-1996", "29-03-1996"),
+                                ("31/02/2020", "31/02/2020"), ("", "")):
+            with self.subTest(value=value):
+                self.assertEqual(format_exam_date(value), expected)
+
+    def test_typed_exam_date_and_sql_endpoints_must_be_in_the_stored_form(self):
+        date_error = "Ngày thi/sát hạch phải là ngày có thật, nhập dạng dd-mm-yyyy (ví dụ 29-03-1996)."
+        for value in ("15/09/2015", "1-3-2025", "31-02-2020", "29-03-96"):
+            with self.subTest(value=value):
+                self.assertEqual(typed_format_errors(group="SQL", exam_date=value), {"exam_date": date_error})
+        self.assertEqual(typed_format_errors(group="SQL", exam_date="29-03-1996", first_license_no="AM570000",
+                                             last_license_no="C244601"), {})
+        errors = typed_format_errors(group="SQL", exam_date="29-03-1996", first_license_no="am570000",
+                                     last_license_no="AM 570200")
+        self.assertEqual(errors, {
+            "first_license_no": "Số GPLX đầu phải viết hoa, gồm 1–2 chữ cái và 6 chữ số liền nhau (ví dụ AM570000).",
+            "last_license_no": "Số GPLX cuối phải viết hoa, gồm 1–2 chữ cái và 6 chữ số liền nhau (ví dụ AM570000).",
+        })
+        # Only SQL names use the GPLX numbers; an empty box is reported by the naming rules.
+        self.assertEqual(typed_format_errors(group="QĐTT", exam_date="15-09-2015", first_license_no="am1"), {})
+        self.assertEqual(typed_format_errors(group="SQL", exam_date=""), {})
 
     def test_province_requires_a_selection_and_confirmation_for_conflicts(self):
         fields = dict(exam_date="01/03/2025", decision_number="3081", suggested_province_code="08")

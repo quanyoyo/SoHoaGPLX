@@ -3,69 +3,83 @@ Module for managing and updating the Province Master Summary Excel file:
 'SỔ THEO DÕI, RÀ SOÁT DÃY SỐ GPLX TRONG SỔ GỐC'
 """
 import os
+import re
+import socket
+import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from tempfile import mkstemp
 from threading import RLock
 from typing import Dict, Any
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
+# Layout of the reference workbook "File tổng soát số hóa GPLX.xlsx".
+TITLE = "SỔ THEO DÕI, RÀ SOÁT DÃY SỐ GPLX TRONG SỔ GỐC"
+SHEET_NAME = "DANH SACH SO GOC"
+LEGACY_SHEET_NAME = "Theo dõi dãy số GPLX"
+TABLE_NAME = "SoGocTongHop"
+HEADER_ROW = 2
+FIRST_DATA_ROW = 3
 HEADERS = [
-    ("STT", 6, "center"),
-    ("Loại sổ", 32, "left"),
-    ("Ngày tại bìa sổ", 16, "center"),
-    ("Tên file PDF", 36, "left"),
-    ("HỘP", 10, "center"),
-    ("HỘP SỐ", 12, "center"),
-    ("Hạng", 10, "center"),
-    ("Tổng số lượng GPLX", 18, "center"),
-    ("Số GPLX trong file", 38, "left"),
-    ("Tổng số trang PDF", 16, "center"),
-    ("Ghi chú / nhận định", 24, "center"),
-    ("Ngày cập nhật", 18, "center")
+    ("STT", 5.75),
+    ("Loại sổ", 21.5),
+    ("Ngày tại bìa sổ", 12.83),
+    ("Tên file PDF", 21.5),
+    ("HỘP", 8.91),
+    ("HỘP SỐ", 9.83),
+    ("Hạng", 9),
+    ("Tổng số lượng GPLX", 11),
+    ("Số GPLX trong file", 56),
+    ("Tổng số trang PDF", 10.58),
+    ("Ghi chú / nhận định", 20.83),
+    ("Ngày cập nhật", 15),
 ]
+_LAST_COLUMN = get_column_letter(len(HEADERS))
+_DATE_FORMAT = "dd/mm/yyyy"
+_DATETIME_FORMAT = "dd/mm/yyyy hh:mm"
+_FONT = "Times New Roman"
+_THIN = Side(style="thin", color="000000")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 _SUMMARY_LOCK = RLock()
 _RENAME_SHEET = "_GPLX_Rename"
+# Several machines save into the same summary on the host's share.
+LOCK_WAIT_SECONDS = 15
+LOCK_STALE_SECONDS = 120
+
+
+class SummaryBusyError(OSError):
+    pass
 
 
 def _new_summary_workbook():
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Theo dõi dãy số GPLX"
-    ws.views.sheetView[0].showGridLines = True
+    ws.title = SHEET_NAME
 
-    # Title
-    ws.merge_cells("A1:L1")
+    ws.merge_cells(f"A1:{_LAST_COLUMN}1")
     title_cell = ws["A1"]
-    title_cell.value = "SỔ THEO DÕI, RÀ SOÁT DÃY SỐ GPLX TRONG SỔ GỐC"
-    title_cell.font = Font(name="Times New Roman", size=14, bold=True, color="002060")
+    title_cell.value = TITLE
+    title_cell.font = Font(name=_FONT, size=17, bold=True, color="FFFFFF")
+    title_cell.fill = PatternFill("solid", fgColor="17324F")
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[1].height = 36
 
-    # Headers at row 2
-    header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-    header_font = Font(name="Times New Roman", size=11, bold=True, color="FFFFFF")
-    thin_border = Border(
-        left=Side(style='thin', color='BFBFBF'),
-        right=Side(style='thin', color='BFBFBF'),
-        top=Side(style='thin', color='BFBFBF'),
-        bottom=Side(style='thin', color='BFBFBF')
-    )
+    ws.row_dimensions[HEADER_ROW].height = 44
+    for col_idx, (col_name, col_width) in enumerate(HEADERS, start=1):
+        cell = ws.cell(row=HEADER_ROW, column=col_idx, value=col_name)
+        cell.font = Font(name=_FONT, size=11, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="0D766E")
+        cell.alignment = _CENTER
+        cell.border = _BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = col_width
 
-    ws.row_dimensions[2].height = 25
-    for col_idx, (col_name, col_width, col_align) in enumerate(HEADERS, start=1):
-        cell = ws.cell(row=2, column=col_idx)
-        cell.value = col_name
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin_border
-        col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].width = col_width
-
+    ws.freeze_panes = f"B{FIRST_DATA_ROW}"
+    _sync_table(ws, FIRST_DATA_ROW)
     return wb
 
 
@@ -77,11 +91,60 @@ def _file_stamp(path):
         return None
 
 
+def lock_path(path):
+    directory, name = os.path.split(os.path.abspath(path))
+    return os.path.join(directory, f".{name}.lock")
+
+
+@contextmanager
+def _machine_lock(path, wait=None):
+    """Exclusive lock file next to the summary, shared by every machine using the folder."""
+    lock = lock_path(path)
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    deadline = time.monotonic() + (LOCK_WAIT_SECONDS if wait is None else wait)
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > LOCK_STALE_SECONDS:
+                    os.unlink(lock)  # left by a machine that stopped while saving
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                owner = ""
+                try:
+                    with open(lock, encoding="utf-8", errors="replace") as handle:
+                        owner = handle.read(200).strip()
+                except OSError:
+                    pass
+                raise SummaryBusyError(
+                    f"Máy khác đang ghi sổ {os.path.basename(path)}{f' ({owner})' if owner else ''}. "
+                    "Hãy đợi vài giây rồi xác nhận lại."
+                )
+            time.sleep(0.3)
+    try:
+        os.write(fd, f"{socket.gethostname()} {time.strftime('%d/%m/%Y %H:%M:%S')}".encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        yield
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
 @contextmanager
 def edit_master_summary(path):
     """Publish a complete workbook in one replacement so a locked file stays intact."""
     directory = os.path.dirname(os.path.abspath(path))
-    with _SUMMARY_LOCK:
+    with _SUMMARY_LOCK, _machine_lock(path):
         stamp = _file_stamp(path)
         workbook = openpyxl.load_workbook(path) if stamp is not None else _new_summary_workbook()
         try:
@@ -114,9 +177,89 @@ def _filename_key(name):
 
 
 def _summary_sheet(workbook):
-    if "Theo dõi dãy số GPLX" in workbook.sheetnames:
-        return workbook["Theo dõi dãy số GPLX"]
+    for name in (SHEET_NAME, LEGACY_SHEET_NAME):
+        if name in workbook.sheetnames:
+            return workbook[name]
     return next(sheet for sheet in workbook.worksheets if sheet.sheet_state == "visible")
+
+
+def _is_data_row(ws, row):
+    # Column A alone does not make a record; blank separator rows may keep their borders or STT.
+    return any(ws.cell(row, col).value not in (None, "") for col in range(2, len(HEADERS) + 1))
+
+
+def _last_data_row(ws):
+    """Rows below the table can carry formatting only, so max_row is not the end of the data."""
+    for row in range(ws.max_row, FIRST_DATA_ROW - 1, -1):
+        if _is_data_row(ws, row):
+            return row
+    return FIRST_DATA_ROW - 1
+
+
+def _renumber(ws):
+    """STT follows the records from top to bottom, skipping separator rows."""
+    number = 0
+    for row in range(FIRST_DATA_ROW, _last_data_row(ws) + 1):
+        if _is_data_row(ws, row):
+            number += 1
+            ws.cell(row, 1).value = number
+
+
+def _headers_match(ws):
+    return all(
+        str(ws.cell(HEADER_ROW, col).value or "").strip() == name
+        for col, (name, _) in enumerate(HEADERS, start=1)
+    )
+
+
+def _sync_table(ws, last_row):
+    """Extend the summary's Excel table to the last record, creating it when the layout matches."""
+    ref = f"A{HEADER_ROW}:{_LAST_COLUMN}{max(last_row, FIRST_DATA_ROW)}"
+    for table in ws.tables.values():
+        if table.ref.split(":")[0] == f"A{HEADER_ROW}":
+            table.ref = ref
+            if table.autoFilter is not None:
+                table.autoFilter.ref = ref
+            return
+    if ws.tables or not _headers_match(ws):
+        return
+    workbook = ws.parent
+    used = {name for sheet in workbook.worksheets for name in sheet.tables}
+    name = TABLE_NAME
+    suffix = 1
+    while name in used:
+        suffix += 1
+        name = f"{TABLE_NAME}{suffix}"
+    # Excel table column names must equal the header cells exactly, including stray spaces.
+    for col in range(1, len(HEADERS) + 1):
+        cell = ws.cell(HEADER_ROW, col)
+        cell.value = str(cell.value)
+    table = Table(displayName=name, ref=ref)
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    ws.add_table(table)
+
+
+def _as_date(value):
+    if isinstance(value, (date, datetime)):
+        return value
+    match = re.fullmatch(r"\s*([0-9]{1,2})\s*[-/.]\s*([0-9]{1,2})\s*[-/.]\s*([0-9]{4})\s*", str(value or ""))
+    if match:
+        day, month, year = map(int, match.groups())
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            pass
+    return value
+
+
+def _as_number(value):
+    """Store plain box numbers as numbers like the reference workbook; keep codes such as '01' as text."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isascii() and text.isdigit() and (len(text) == 1 or not text.startswith("0")):
+            return int(text)
+        return text
+    return value
 
 
 def summary_rows_by_name(workbook):
@@ -129,6 +272,42 @@ def summary_rows_by_name(workbook):
     return rows
 
 
+def _date_text(value):
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%d/%m/%Y")
+    return str(value or "").strip()
+
+
+def read_summary_entries(workbook):
+    """Summary rows as {field: value}, one per dossier name; names listed twice are left out."""
+    worksheet = _summary_sheet(workbook)
+    entries, seen = {}, set()
+    for values in worksheet.iter_rows(min_row=FIRST_DATA_ROW, max_col=len(HEADERS), values_only=True):
+        values = (*values, *[None] * (len(HEADERS) - len(values)))
+        key = _filename_key(values[3])
+        if not key:
+            continue
+        if key in seen:
+            entries.pop(key, None)
+            continue
+        seen.add(key)
+        total = values[7]
+        entries[key] = {
+            "pdf_filename": str(values[3]).strip().removesuffix(".pdf").removesuffix(".PDF"),
+            "book_type": str(values[1] or "").strip(),
+            "cover_date": _date_text(values[2]),
+            "box": str(values[4] if values[4] is not None else "").strip(),
+            "box_number": str(values[5] if values[5] is not None else "").strip(),
+            "license_class": str(values[6] or "").strip(),
+            "total_licenses": total if isinstance(total, int) else
+            int(total) if isinstance(total, str) and total.strip().isdigit() else None,
+            "license_sequence": str(values[8] or "").strip(),
+            "total_pages": values[9] if isinstance(values[9], int) and values[9] > 0 else 1,
+            "status_note": str(values[10] or "").strip(),
+        }
+    return list(entries.values())
+
+
 def read_rename_records(workbook):
     if _RENAME_SHEET not in workbook.sheetnames:
         return []
@@ -139,90 +318,140 @@ def read_rename_records(workbook):
     ]
 
 
-def record_folder_rename(workbook, filename, source, target):
-    """Validate ownership without relying on PDF bytes or the visible filename alone."""
-    records = read_rename_records(workbook)
-    wanted = _filename_key(filename)
-    rows = summary_rows_by_name(workbook).get(wanted, [])
-    source_key = os.path.normcase(os.path.normpath(source))
-    target_key = os.path.normcase(os.path.normpath(target))
-    owners = [(src, dest) for name, src, dest in records if _filename_key(name) == wanted]
-    already_linked = len(owners) == 1 and len(rows) == 1 and (
-        os.path.normcase(os.path.normpath(owners[0][0])), os.path.normcase(os.path.normpath(owners[0][1]))
-    ) == (source_key, target_key)
-    if already_linked:
-        return True
-    if owners or rows:
-        raise FileExistsError(f"Sổ tổng hợp đã có tên {filename}.pdf cho hồ sơ khác hoặc chưa rõ nguồn. Hãy chọn tên khác.")
-    if any(os.path.normcase(os.path.normpath(src)) == source_key for _, src, _ in records):
-        raise FileExistsError("PDF nguồn đã được xác nhận với tên khác trong sổ tổng hợp.")
+def _norm(path):
+    return os.path.normcase(os.path.normpath(path))
+
+
+_RENAME_HEADERS = ("Tên file", "PDF nguồn", "PDF đích", "Nhóm hồ sơ", "Ngày thi")
+
+
+def _rename_sheet(workbook):
     if _RENAME_SHEET not in workbook.sheetnames:
         links = workbook.create_sheet(_RENAME_SHEET)
         links.sheet_state = "hidden"
-        links.append(("Tên file", "PDF nguồn", "PDF đích"))
+        links.append(_RENAME_HEADERS)
     links = workbook[_RENAME_SHEET]
-    row = links.max_row + 1
-    for index, value in enumerate((filename, source, target), 1):
+    for column, header in enumerate(_RENAME_HEADERS, 1):
+        if links.cell(1, column).value in (None, ""):
+            links.cell(1, column, header)  # sheets written by older versions have 3 columns
+    return links
+
+
+def read_rename_details(workbook):
+    """{dossier name key: (group, exam date)}; empty strings for records of older versions.
+
+    A QĐTT summary row shows the signing date, so its exam date is kept here.
+    """
+    if _RENAME_SHEET not in workbook.sheetnames:
+        return {}
+    details = {}
+    for name, _source, _target, group, exam in workbook[_RENAME_SHEET].iter_rows(min_row=2, max_col=5, values_only=True):
+        if isinstance(name, str) and name.strip():
+            details[_filename_key(name)] = (str(group or "").strip(), str(exam or "").strip())
+    return details
+
+
+def register_dossier_name(workbook, filename, current, target, *, same_file=None, group="", exam_date=""):
+    """Claim filename for the PDF at current (relative to the province folder), renamed to target.
+
+    The rename sheet keeps one record per dossier: its name, the original scan file and the
+    current PDF. A PDF saved before keeps its record, so saving it again under another name
+    renames the record instead of claiming a second one. Returns the name the dossier had
+    before (None for a new dossier), so its summary row can be updated in place.
+
+    same_file(saved target) tells whether the PDF at current is a copy of a PDF saved from the
+    same scan name (left by older versions, which copied instead of renaming). Without it any
+    PDF at a saved scan's path is refused; with it a new scan reusing that name is a new dossier.
+    """
+    wanted = _filename_key(filename)
+    rows = summary_rows_by_name(workbook)
+    current_key, target_key = _norm(current), _norm(target)
+    links = _rename_sheet(workbook)
+    records = [
+        (row, name, source, dest)
+        for row, (name, source, dest) in enumerate(links.iter_rows(min_row=2, max_col=3, values_only=True), 2)
+        if all(isinstance(value, str) and value for value in (name, source, dest))
+    ]
+    own = next((record for record in records if _norm(record[3]) == current_key), None)
+    previous = own[1] if own else None
+    if own is None:
+        # Saved by an older version (no record yet): the PDF already carries its summary name.
+        stem = _filename_key(os.path.splitext(os.path.basename(current))[0])
+        if len(rows.get(stem, [])) == 1 and not any(_filename_key(r[1]) == stem for r in records):
+            previous = os.path.splitext(os.path.basename(current))[0]
+        moved = next((r for r in records if _norm(r[2]) == current_key and _norm(r[3]) != current_key
+                      and (same_file is None or same_file(r[3]))), None)
+        if moved is not None:
+            raise FileExistsError(f"PDF này đã được lưu thành {os.path.basename(moved[3])} trước đây.")
+    if any(_filename_key(r[1]) == wanted for r in records if r is not own):
+        raise FileExistsError(f"Sổ tổng hợp đã có tên {filename}.pdf cho hồ sơ khác. Hãy chọn tên khác.")
+    claimed = rows.get(wanted, [])
+    if len(claimed) > 1 or (claimed and _filename_key(previous) != wanted):
+        raise FileExistsError(f"Sổ tổng hợp đã có tên {filename}.pdf cho hồ sơ khác hoặc chưa rõ nguồn. Hãy chọn tên khác.")
+    if own is not None:
+        row = own[0]
+        values = (filename, own[2], target, group, exam_date)
+    else:
+        row = links.max_row + 1
+        values = (filename, current, target, group, exam_date)
+    for index, value in enumerate(values, 1):
         links.cell(row, index, value).data_type = "s"
-    return False
+    return previous
 
 
-def write_summary_entry(workbook, record: Dict[str, Any]) -> None:
+def record_folder_rename(workbook, filename, source, target):
+    """Backward-compatible wrapper: True when the PDF was already saved under filename."""
+    return _filename_key(register_dossier_name(workbook, filename, source, target)) == _filename_key(filename)
+
+
+def write_summary_entry(workbook, record: Dict[str, Any], previous_filename=None) -> None:
     ws = _summary_sheet(workbook)
-    
-    # Styling
-    font_body = Font(name="Times New Roman", size=11)
-    font_bold = Font(name="Times New Roman", size=11, bold=True)
-    fill_alt = PatternFill(start_color="F2F5F8", end_color="F2F5F8", fill_type="solid")
-    thin_border = Border(
-        left=Side(style='thin', color='BFBFBF'),
-        right=Side(style='thin', color='BFBFBF'),
-        top=Side(style='thin', color='BFBFBF'),
-        bottom=Side(style='thin', color='BFBFBF')
-    )
 
     pdf_filename = record.get("pdf_filename", "")
-    
-    rows = summary_rows_by_name(workbook).get(_filename_key(pdf_filename), [])
+
+    names = summary_rows_by_name(workbook)
+    rows = names.get(_filename_key(pdf_filename), [])
+    if not rows and previous_filename:
+        rows = names.get(_filename_key(previous_filename), [])
     target_row = rows[0] if rows else None
-            
+
     is_new = (target_row is None)
     if is_new:
-        target_row = ws.max_row + 1
-        stt = target_row - 2
-    else:
-        stt = ws.cell(row=target_row, column=1).value or (target_row - 2)
+        # Append right after the last record; formatted empty rows below the table do not count.
+        target_row = _last_data_row(ws) + 1
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
     row_values = [
-        (stt, "center", font_body),
-        (record.get("book_type", "Sổ gốc cấp bằng lái xe cơ giới đường bộ"), "left", font_body),
-        (record.get("cover_date", ""), "center", font_body),
-        (pdf_filename, "left", font_bold),
-        (record.get("box", "48"), "center", font_body),
-        (record.get("box_number", "115"), "center", font_body),
-        (record.get("license_class", "A1"), "center", font_bold),
-        (record.get("total_licenses", 0), "center", font_bold),
-        (record.get("license_sequence", ""), "left", font_body),
-        (record.get("total_pages", 1), "center", font_body),
-        (record.get("status_note", "Đủ"), "center", font_bold),
-        (now_str, "center", font_body)
+        None,  # STT is renumbered below.
+        record.get("book_type", "Sổ gốc cấp bằng lái xe cơ giới đường bộ"),
+        _as_date(record.get("cover_date", "")),
+        pdf_filename,
+        _as_number(record.get("box", "")),
+        _as_number(record.get("box_number", "")),
+        record.get("license_class", ""),
+        record.get("total_licenses", 0),
+        record.get("license_sequence", ""),
+        record.get("total_pages", 1),
+        record.get("status_note", ""),
+        datetime.now().replace(second=0, microsecond=0),
     ]
 
     if is_new:
-        ws.row_dimensions[target_row].height = 22
-    for col_idx, (val, align, font_style) in enumerate(row_values, start=1):
+        ws.row_dimensions[target_row].height = 28
+    for col_idx, val in enumerate(row_values, start=1):
         cell = ws.cell(row=target_row, column=col_idx)
-        cell.value = val
-        if isinstance(val, str):
-            cell.data_type = "s"
+        if col_idx > 1:
+            cell.value = val
+            if isinstance(val, str):
+                cell.data_type = "s"
+        if isinstance(val, datetime):
+            cell.number_format = _DATETIME_FORMAT if col_idx == len(HEADERS) else _DATE_FORMAT
         if is_new:
-            cell.font = font_style
-            cell.alignment = Alignment(horizontal=align, vertical="center")
-            cell.border = thin_border
-            if target_row % 2 == 1:
-                cell.fill = fill_alt
+            cell.font = Font(name=_FONT, size=11)
+            cell.alignment = _CENTER
+            cell.border = _BORDER
+
+    _renumber(ws)
+    _sync_table(ws, _last_data_row(ws))
 
 
 def update_or_append_summary_entry(summary_file_path: str, record: Dict[str, Any]) -> str:

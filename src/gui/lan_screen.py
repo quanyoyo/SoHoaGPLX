@@ -214,24 +214,30 @@ class LANScreenFrame(ctk.CTkFrame):
             messagebox.showinfo("Thông báo", "Đã tắt máy chủ chia sẻ mạng LAN.")
         else:
             try:
-                port = int(self.entry_port.get().strip())
-            except ValueError:
-                port = 8080
-
-            try:
-                url = lan_server.start(port=port)
+                url = lan_server.start(port=self._entered_port())
                 self.refresh_state()
                 messagebox.showinfo("Khởi chạy thành công", f"Máy chủ mạng LAN đã được kích hoạt!\n\nĐường dẫn: {url}")
             except Exception as exc:
                 logger.exception("Could not start LAN sharing server")
                 messagebox.showerror("Không thể bật chia sẻ mạng LAN", f"Lỗi: {exc}\n\nChi tiết đã được ghi vào log.")
 
+    def _entered_port(self):
+        """The typed port; an empty box means the default 8080."""
+        text = self.entry_port.get().strip() or "8080"
+        if not (text.isascii() and text.isdigit()):
+            raise ValueError(f"Cổng \"{text}\" không hợp lệ. Cổng phải là số từ 1 đến 65535 (mặc định 8080).")
+        return int(text)
+
     def refresh_state(self):
         """Refreshes UI state, labels, stats, and QR code."""
         ip = get_lan_ip()
         self.lbl_ip.configure(text=ip)
 
-        port = self.entry_port.get().strip() if hasattr(self, "entry_port") else "8080"
+        # While sharing, the address is the port in use, not what was typed since.
+        if lan_server.is_running:
+            port = lan_server.port
+        else:
+            port = self.entry_port.get().strip() if hasattr(self, "entry_port") else "8080"
         url = f"http://{ip}:{port}"
         self.lbl_url.configure(text=url)
 
@@ -240,7 +246,7 @@ class LANScreenFrame(ctk.CTkFrame):
         self.lbl_stats.configure(
             text=f"• Tổng số cuốn sổ đã số hóa: {stats['total_dossiers']} cuốn\n"
                  f"• Tổng số công dân tra cứu: {stats['total_citizens']} người\n"
-                 f"• CSDL SQLite FTS5: Đang hoạt động siêu tốc (< 20ms)"
+                 f"• CSDL SQLite dùng chung: đang hoạt động"
         )
 
         if lan_server.is_running:
@@ -292,7 +298,7 @@ class LANScreenFrame(ctk.CTkFrame):
         """Opens the web client in default browser."""
         if not lan_server.is_running:
             try:
-                lan_server.start(port=int(self.entry_port.get().strip() or 8080))
+                lan_server.start(port=self._entered_port())
                 self.refresh_state()
             except Exception as exc:
                 logger.exception("Could not start LAN sharing server from browser action")

@@ -40,8 +40,8 @@ def parse_folder_hierarchy(pdf_path: str) -> Dict[str, str]:
     # Defaults
     info = {
         "province_folder": "",
-        "box": "48",       # HỘP (Tủ hồ sơ)
-        "box_number": "115" # HỘP SỐ (Hộp giấy)
+        "box": "",         # HỘP (Tủ hồ sơ)
+        "box_number": ""    # HỘP SỐ (Hộp giấy)
     }
     
     if len(parts) >= 2:
@@ -80,26 +80,62 @@ def find_province_root_dir(pdf_path: str) -> str:
     return abs_dir
 
 
-def folder_review_location(pdf_path: str) -> Dict[str, str]:
+# Any punctuation may stand between the word and the number: "HOP (49)", "HOP#49", "HOP_SO_115".
+_SEPARATOR = r"[^a-z0-9]*"
+_END = r"(?![a-z0-9])"
+# The number right after the word and its letter, joined ("49A") or apart ("49 A"); then the rest of the name.
+_NUMBER = rf"([0-9]+)(?:([a-z]{{1,2}}){_END}|[ _\-.]+([a-z]){_END}|{_END})(.*)"
+_BOX_NUMBER_FOLDER = re.compile(rf"(?:hop{_SEPARATOR}so|ho{_SEPARATOR}so){_SEPARATOR}{_NUMBER}")
+_BOX_FOLDER = re.compile(rf"(?:hop|tu){_SEPARATOR}{_NUMBER}")
+
+
+def _folded(name):
+    text = unicodedata.normalize("NFD", name.casefold().replace("đ", "d"))
+    return "".join(c for c in text if not unicodedata.combining(c)).strip()
+
+
+def _box_value(match, folder_name, label):
+    """The box value, or "" and a note when another number follows ("HOP 49 (2010)")."""
+    if re.search(r"[0-9]", match[4]):
+        return "", f"Tên thư mục \"{folder_name}\" có nhiều số, hãy đối chiếu và nhập {label}."
+    return f"{match[1]}{match[2] or match[3] or ''}".upper(), ""
+
+
+def folder_review_location(pdf_path: str) -> Dict[str, Any]:
     """Find the province and box fields for folders selected at any archive level."""
     parent = Path(pdf_path).resolve().parent
     lineage = [*reversed(parent.parents), parent]
     root = parent
     archive_province = None
     box = box_number = ""
+    found_box = False
+    review = {}
     for index, folder in enumerate(lineage):
         key = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFD", folder.name.casefold()))
+        name = _folded(folder.name)
         if key in {"dulieusohoagpls", "dulieusohoagplx", "dulieugplx"} and index + 1 < len(lineage):
             next_folder = lineage[index + 1]
             if re.fullmatch(r"0[123]_.*", next_folder.name) and index + 2 < len(lineage):
                 next_folder = lineage[index + 2]
             root = archive_province = next_folder
-        elif re.fullmatch(r"(?:hopso|hoso)(?:\d+|[a-z][a-z0-9]*)", key):
-            box_number = extract_clean_number_or_name(folder.name)
-            if not box and root == parent:
+        elif (match := _BOX_NUMBER_FOLDER.fullmatch(name)) or re.fullmatch(r"(?:hopso|hoso)[a-z][a-z0-9]*", key):
+            if match:
+                box_number, note = _box_value(match, folder.name, "Hộp số")
+            else:
+                box_number, note = extract_clean_number_or_name(folder.name), ""
+            review.pop("box_number", None)
+            if note:
+                review["box_number"] = note
+            if not found_box and root == parent:
                 root = folder.parent
-        elif not box and re.fullmatch(r"(?:hop|tu)\d+", key):
+        elif (not found_box and (match := _BOX_FOLDER.fullmatch(name))
+              # "Từ 1990 đến 1995" (from … to) folds to the same letters as "Tủ" (cabinet).
+              and not unicodedata.normalize("NFC", folder.name).casefold().startswith("từ")):
             if not archive_province or archive_province == folder:
                 root = folder.parent
-            box = extract_clean_number_or_name(folder.name)
-    return {"province_root": str(root), "province_folder": root.name, "box": box, "box_number": box_number}
+            box, note = _box_value(match, folder.name, "Hộp")
+            found_box = True
+            if note:
+                review["box"] = note
+    return {"province_root": str(root), "province_folder": root.name, "box": box, "box_number": box_number,
+            "box_review": review}

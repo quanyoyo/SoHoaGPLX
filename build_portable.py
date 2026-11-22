@@ -22,6 +22,38 @@ for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(errors="replace")
 
+def _runtime_file(filename):
+    """Locks, Excel owner files and save leftovers made while the app runs."""
+    name = filename.lower()
+    return name.endswith((".lock", ".gplx-old", ".old")) or name.startswith(("~$", ".gplx-"))
+
+
+def _copy_tree_safe(src_dir, dst_dir):
+    """Copies src_dir into dst_dir. If a destination file is in use by a running app,
+    it renames the active file to .old first so the updated file can be placed."""
+    for root, dirs, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        target_root = os.path.join(dst_dir, rel) if rel != "." else dst_dir
+        os.makedirs(target_root, exist_ok=True)
+        for f in files:
+            src_file = os.path.join(root, f)
+            dst_file = os.path.join(target_root, f)
+            try:
+                shutil.copy2(src_file, dst_file)
+            except (PermissionError, OSError):
+                old_file = dst_file + ".old"
+                try:
+                    if os.path.exists(old_file):
+                        os.remove(old_file)
+                except OSError:
+                    pass
+                try:
+                    os.rename(dst_file, old_file)
+                    shutil.copy2(src_file, dst_file)
+                except OSError as exc:
+                    raise exc
+
+
 def build():
     print("=" * 70)
     print(" BẮT ĐẦU ĐÓNG GÓI PORTABLE ỨNG DỤNG SỐ HÓA GPLX CHO NGƯỜI DÙNG NON-IT ")
@@ -113,8 +145,8 @@ def build():
             shutil.copy2(seed_db, saved_seed)
         os.makedirs(app_target_dir, exist_ok=True)
         try:
-            shutil.copytree(built_app_dir, app_target_dir, dirs_exist_ok=True)
-        except (PermissionError, shutil.Error) as exc:
+            _copy_tree_safe(built_app_dir, app_target_dir)
+        except (PermissionError, shutil.Error, OSError) as exc:
             print("[!] Không thể cập nhật gói vì file ứng dụng đang được sử dụng.")
             print("    Hãy đóng GPLX_SoHoa_TraCuu.exe rồi mở lại Build_So_Hoa_GPLX.bat.")
             print(f"    Chi tiết: {exc}")
@@ -145,9 +177,14 @@ def build():
             "1. Giai nen nguyen folder 'So Hoa GPLX' vao vi tri ban muon.\n"
             "2. Mo folder vua giai nen va nhap dup 'Chay_Ngay.bat'.\n"
             "3. Chon cac file PDF trong kho DuLieuSoHoa_GPLS de xu ly.\n\n"
-            "Khong can cai Python hoac thu vien. Nen giai nen vao noi ban co quyen ghi du lieu.\n"
-            "Du lieu va co so tra cuu cua moi tai khoan Windows duoc luu trong LocalAppData\\GPLX.\n"
-            "Xem log loi bang cach mo file Xem_Nhat_Ky.bat trong folder goc.\n"
+            "Khong can cai Python hoac thu vien. Nen giai nen vao noi ban co quyen ghi du lieu.\n\n"
+            "DUNG CHUNG QUA MANG LAN:\n"
+            "- May chu: chia se folder 'So Hoa GPLX' (quyen doc + ghi) cho cac may con.\n"
+            "- May con: mo folder chia se qua mang LAN va chay 'Chay_Ngay.bat'. OCR chay tren may con;\n"
+            "  PDF, Excel va co so tra cuu dung chung trong folder nay.\n"
+            "- Co so tra cuu: So Hoa GPLX\\HeThong\\gplx_index.db. Moi ngay tu sao luu 1 ban vao\n"
+            "  HeThong\\SaoLuu (giu 7 ban gan nhat).\n\n"
+            "Xem log loi bang cach mo file Xem_Nhat_Ky.bat (log luu tren tung may, LocalAppData\\GPLX\\logs).\n"
             "Goi nay danh cho Windows 64-bit.\n"
         )
 
@@ -172,11 +209,16 @@ def build():
         os.remove(zip_path)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for current_dir, dirnames, filenames in os.walk(handover_dir):
+            if os.path.normcase(current_dir) == os.path.normcase(handover_dir):
+                # The shared database and its backups are created at run time, never shipped.
+                dirnames[:] = [d for d in dirnames if d.lower() != "hethong"]
             for dirname in dirnames:
                 folder_path = os.path.join(current_dir, dirname)
                 folder_name = os.path.relpath(folder_path, base_dir).replace(os.sep, "/") + "/"
                 archive.writestr(folder_name, "")
             for filename in filenames:
+                if _runtime_file(filename):
+                    continue
                 file_path = os.path.join(current_dir, filename)
                 archive_name = os.path.relpath(file_path, base_dir).replace(os.sep, "/")
                 archive.write(file_path, archive_name)

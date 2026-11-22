@@ -25,7 +25,11 @@ _DATE_VALUE = (
     r"(?:[ \t]*[-/.]+[ \t]*|\s+thang\s*)"
     r"([0-9]{1,2})(?:[ \t]*[-/.]+[ \t]*|\s+nam\s*)([0-9]{4})(?![0-9])"
 )
-_EXAM_LABEL = r"\b(?:ngay\s+(?:thi|sat\s*hach)|(?:thi|sat\s*hach)\s+ngay)[ \t:.\-]*"
+# Dates outside these bounds, or whose digits OCR read with less confidence, are left blank for review.
+EARLIEST_YEAR = 1990
+DATE_MIN_CONFIDENCE = 0.50  # handwritten dates read correctly score 0.59-0.79 in the samples
+# OCR often joins the label words ("NGAYTHI:").
+_EXAM_LABEL = r"\b(?:ngay\s*(?:thi|sat\s*hach)|(?:thi|sat\s*hach)\s+ngay)[ \t:.\-]*"
 
 
 def _fold(text):
@@ -35,15 +39,33 @@ def _fold(text):
     )
 
 
-def _read_date(text, label):
-    dates = set()
+def _read_date(text, label, offset=0):
+    """The single date written after the label, with the spans of its digits (offset = start of text)."""
+    dates = {}
     for match in re.finditer(label + _DATE_VALUE, text):
         day, month, year = map(int, match.groups())
         try:
-            dates.add(date(year, month, day))
+            value = date(year, month, day)
         except ValueError:
             continue
-    return dates.pop() if len(dates) == 1 else None
+        dates.setdefault(value, []).append((offset + match.start(1), offset + match.end(3)))
+    if len(dates) != 1:
+        return None, []
+    (value, spans), = dates.items()
+    return value, spans
+
+
+def _date_doubt(value, spans, low_confidence_spans):
+    """Why a date that was read should not be trusted, or "" when it can be used."""
+    if value is None:
+        return ""
+    if value.year < EARLIEST_YEAR or value > date.today():
+        return "không hợp lý"
+    # Every place the date is written was read with low confidence.
+    if spans and all(any(start < end2 and start2 < end for start2, end2 in low_confidence_spans)
+                     for start, end in spans):
+        return "đọc mờ"
+    return ""
 
 
 def _format_date(value):
@@ -66,7 +88,7 @@ def _decision_number(text, label):
 
 def parse_cover_page_text(
     ocr_text: str, *, header_text: str | None = None, page_number: int = 1,
-    uncertain_decision_number: bool = False,
+    uncertain_decision_number: bool = False, low_confidence_spans=(),
 ) -> dict:
     """Use header context for the decision and explicit labels for the exam date."""
     raw = unicodedata.normalize("NFC", ocr_text).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
@@ -87,9 +109,9 @@ def parse_cover_page_text(
     else:
         document_type = "unknown"
 
-    exam = _read_date(full_text, _EXAM_LABEL + r"\s*")
+    exam, exam_spans = _read_date(full_text, _EXAM_LABEL + r"\s*")
     decision_number = ""
-    signed = None
+    signed, signed_spans = None, []
     review = {}
     if document_type == "unknown":
         review["document_type"] = "Chưa nhận diện được loại tài liệu."
@@ -98,18 +120,30 @@ def parse_cover_page_text(
         if re.search(_OWN_NUMBER_LABEL, preamble) and (title or not attachment):
             decision_number = _decision_number(preamble, _OWN_NUMBER_LABEL)
             # Decisions put the date next to the locality in the header.
-            signed = _read_date(preamble, r"(?:^|[,;\t\n])\s*(?:[a-z ]+,\s*)?ngay[ \t]*")
+            signed, signed_spans = _read_date(preamble, r"(?:^|[,;\t\n])\s*(?:[a-z ]+,\s*)?ngay[ \t]*")
         elif attachment:
             decision_number = _decision_number(attachment[0], _ATTACHED_DECISION_LABEL)
-            signed = _read_date(attachment[0], r"\bngay[ \t]*")
+            signed, signed_spans = _read_date(attachment[0], r"\bngay[ \t]*", attachment.start())
         if uncertain_decision_number:
             decision_number = ""
         if not decision_number:
             review["decision_number"] = "Số quyết định chưa đọc rõ."
-        if not signed:
-            review["decision_date"] = "Ngày ký quyết định chưa đọc rõ."
+    # A date that looks wrong is left blank, so the reviewer reads it on the page.
+    if doubt := _date_doubt(exam, exam_spans, low_confidence_spans):
+        review["exam_date"] = f"Ngày thi/sát hạch đọc được {_format_date(exam)} {doubt}, hãy đối chiếu và nhập lại."
+        exam = None
+    if doubt := _date_doubt(signed, signed_spans, low_confidence_spans):
+        review["decision_date"] = f"Ngày ký đọc được {_format_date(signed)} {doubt}, hãy đối chiếu và nhập lại."
+        signed = None
+    if exam and signed and signed < exam < date(2025, 3, 1):
+        # A decision on exam results is signed on or after the exam (QĐSH decisions may come first).
+        note = f"Ngày ký {_format_date(signed)} trước ngày thi {_format_date(exam)}, hãy đối chiếu và nhập lại."
+        review["exam_date"] = review["decision_date"] = note
+        exam = signed = None
+    if document_type in ("decision", "decision_with_list") and not signed:
+        review.setdefault("decision_date", "Ngày ký quyết định chưa đọc rõ.")
     if not exam:
-        review["exam_date"] = "Ngày thi/sát hạch chưa đọc rõ hoặc có nhiều ngày khác nhau."
+        review.setdefault("exam_date", "Ngày thi/sát hạch chưa đọc rõ hoặc có nhiều ngày khác nhau.")
 
     # Restrict province suggestions to the issuing office and the document header.
     issuer_lines = [
@@ -154,23 +188,48 @@ def parse_cover_page_text(
     return fields
 
 
+def _join_overlaps(parts):
+    """Join boxes OCR read twice over the same ink: "29" over "9.-.03-.1996" -> "29.-.03-.1996".
+
+    Only boxes that overlap on the page and whose texts overlap (end of one = start of the next)
+    are joined.
+    """
+    joined = []
+    for x, x1, text, score in parts:
+        if joined:
+            px, px1, ptext, pscore = joined[-1]
+            overlap = next((k for k in range(min(len(ptext), len(text)), 0, -1) if ptext[-k:] == text[:k]), 0)
+            if x < px1 and overlap:
+                joined[-1] = (px, max(px1, x1), ptext + text[overlap:], min(pscore, score))
+                continue
+        joined.append((x, x1, text, score))
+    return joined
+
+
 def parse_cover_ocr(ocr_results, page_height: int, *, page_number: int = 1) -> dict:
     """Rejoin boxes on the same visual line and isolate the top of the page."""
     lines = []
     boxes = sorted(
-        (sum(y for _, y in box) / len(box), min(x for x, _ in box), str(text).strip(), float(score))
+        (sum(y for _, y in box) / len(box), min(x for x, _ in box), max(x for x, _ in box),
+         unicodedata.normalize("NFC", str(text).strip()), float(score))
         for box, text, score in ocr_results
     )
-    for y, x, text, score in boxes:
+    for y, x, x1, text, score in boxes:
         if not lines or y - lines[-1][0] > page_height * 0.016:
             lines.append((y, []))
-        lines[-1][1].append((x, text, score))
+        lines[-1][1].append((x, x1, text, score))
 
     full_lines, header_lines = [], []
     uncertain_decision_number = False
+    # Positions in the page text. Header lines are its first lines, so the header uses the same positions.
+    low_confidence_spans, offset = [], 0
     for y, parts in lines:
-        ordered = sorted(parts)
+        ordered = [(x, text, score) for x, _, text, score in _join_overlaps(sorted(parts))]
         row = " ".join(text for _, text, _ in ordered)
+        for _, text, score in ordered:
+            if score < DATE_MIN_CONFIDENCE and any(c.isdigit() for c in text):
+                low_confidence_spans.append((offset, offset + len(text)))
+            offset += len(text) + 1
         full_lines.append(row)
         if y <= page_height * 0.35:
             # Separate widely spaced header boxes so number and date stay distinct.
@@ -187,5 +246,5 @@ def parse_cover_ocr(ocr_results, page_height: int, *, page_number: int = 1) -> d
         header = full_text
     return parse_cover_page_text(
         full_text, header_text=header, page_number=page_number,
-        uncertain_decision_number=uncertain_decision_number,
+        uncertain_decision_number=uncertain_decision_number, low_confidence_spans=low_confidence_spans,
     )

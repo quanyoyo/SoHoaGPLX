@@ -589,7 +589,10 @@
         if (!res.ok) throw new Error("HTTP error " + res.status);
         const data = await res.json();
 
-        document.getElementById("resultCount").textContent = data.total;
+        // Only the first results are sent: say so when more people match.
+        const matches = data.total_matches ?? data.total;
+        document.getElementById("resultCount").textContent =
+          matches > data.total ? `${data.total}/${matches} đầu tiên — hãy gõ cụ thể hơn để thu hẹp` : data.total;
         document.getElementById("statLatency").textContent = `${data.latency_ms} ms`;
         pill.textContent = `Hoàn tất trong ${data.latency_ms} ms`;
 
@@ -635,32 +638,32 @@
           <td style="text-align: center;">
             <span class="license-badge">${escapeHtml(row.license_number || "")}</span>
           </td>
-          <td style="text-align: center;">${escapeHtml(row.license_class || "A1")}</td>
+          <td style="text-align: center;">${escapeHtml(row.license_class || "")}</td>
           <td style="font-size: 12.5px; color: #475569;">${escapeHtml(boxInfo)}</td>
           <td style="text-align: center; font-weight: 600; color: #2563EB;">Trang ${pageNumber}</td>
           <td style="text-align: center; white-space: nowrap;">
             <button class="action-btn btn-view-pdf" type="button">
               👁️ Xem Trang ${pageNumber}
             </button>
-            <a class="action-btn btn-dl-excel" href="/api/excel?path=${encodeURIComponent(row.excel_path || '')}" download>
+            ${row.has_excel ? `<a class="action-btn btn-dl-excel" href="/api/excel/${encodeURIComponent(row.dossier_id)}" download>
               📊 Tải Excel
-            </a>
+            </a>` : `<span class="action-btn btn-dl-excel" style="opacity: .45; cursor: default;" title="Hồ sơ đổi tên nhanh, chưa có Excel">📊 Chưa có Excel</span>`}
           </td>
         `;
         tr.querySelector(".btn-view-pdf").addEventListener("click", () => {
-          openPdfModal(encodeURIComponent(row.pdf_path || ""), pageNumber, row.full_name || "");
+          openPdfModal(row.dossier_id, pageNumber, row.full_name || "");
         });
         tbody.appendChild(tr);
       });
     }
 
-    function openPdfModal(encodedPdfPath, pageNumber, citizenName) {
+    function openPdfModal(dossierId, pageNumber, citizenName) {
       const modal = document.getElementById("pdfModal");
       const iframe = document.getElementById("pdfIframe");
       const title = document.getElementById("modalPdfTitle");
 
       title.textContent = `Hồ Sơ: ${citizenName} - Đang xem Trang ${pageNumber}`;
-      iframe.src = `/api/pdf?path=${encodedPdfPath}#page=${pageNumber}`;
+      iframe.src = `/api/pdf/${encodeURIComponent(dossierId)}#page=${pageNumber}`;
       modal.classList.add("active");
     }
 

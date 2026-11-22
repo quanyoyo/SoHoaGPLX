@@ -80,7 +80,8 @@ def analyze_license_sequences(license_list: List[str]) -> Dict[str, Any]:
     sequence_summary = "; ".join(ranges)
     
     # Evaluate status
-    if len(ranges) == 1 and "-" in ranges[0] and is_fully_continuous:
+    # One unbroken range, including a list of a single licence.
+    if len(ranges) == 1 and is_fully_continuous:
         status = "Đủ"
     else:
         status = "Ngắt, không theo thứ tự"

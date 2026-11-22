@@ -112,19 +112,61 @@ class ExcelV3Test(unittest.TestCase):
         self.assertEqual(modern_record["box_number"], "116")
         self.assertEqual(len(db.search("00000123")), 1)
 
-        desktop = SimpleNamespace(active_file_path=None, active_item=None, review=Mock(), tabview=Mock(), viewer=Mock())
+        desktop = SimpleNamespace(active_file_path=None, active_item=None, review=Mock(), tabview=Mock(), viewer=Mock(),
+                                  sidebar=SimpleNamespace(show_active=Mock(), queue_items=[]))
         GPLXApp.on_search_view_pdf(desktop, modern_record["pdf_path"], modern_record["page_number"])
         desktop.viewer.load_pdf.assert_called_once_with(str(modern), initial_page=2)
         with patch.object(lan_server, "db_manager", db), TestClient(lan_server.app) as client:
             result = client.get("/api/search", params={"q": "AP014543"}).json()["results"][0]
             self.assertEqual(result["page_number"], 2)
-            response = client.get("/api/pdf", params={"path": result["pdf_path"]})
+            self.assertNotIn("pdf_path", result, "server paths are not sent to LAN clients")
+            self.assertTrue(result["has_excel"])
+            response = client.get(f"/api/pdf/{result['dossier_id']}")
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.headers["content-disposition"].startswith("inline; filename*="))
             self.assertEqual(response.content, modern.read_bytes())
-            response = client.get("/api/excel", params={"path": result["excel_path"]})
+            response = client.get(f"/api/excel/{result['dossier_id']}")
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.headers["content-disposition"].startswith("attachment; filename*="))
+            # Only files recorded in the database are served.
+            self.assertEqual(client.get("/api/pdf/999999").status_code, 404)
+            self.assertEqual(client.get("/api/pdf", params={"path": str(modern)}).status_code, 404)
+            self.assertEqual(client.get("/api/excel", params={"path": result.get("excel_path", "x")}).status_code, 404)
+
+    def test_lan_server_on_a_busy_port_reports_failure(self):
+        import socket
+        blocker = socket.socket()
+        self.addCleanup(blocker.close)
+        blocker.bind(("0.0.0.0", 0))
+        blocker.listen()
+        port = blocker.getsockname()[1]
+        manager = lan_server.LANServerManager()
+        with patch.object(lan_server, "db_manager", Mock()):
+            with self.assertRaises(RuntimeError) as failure:
+                manager.start(port=port)
+            self.assertIn(str(port), str(failure.exception))
+            self.assertFalse(manager.is_running)
+            blocker.close()  # the port is free now: starting again works
+            manager.start(port=port)
+            self.addCleanup(manager.stop)
+            self.assertTrue(manager.is_running)
+            self.assertTrue(manager.thread.is_alive())
+
+    def test_lan_server_rejects_ports_outside_the_valid_range(self):
+        manager = lan_server.LANServerManager(port=8080)
+        for port in (0, 70000, -5):
+            with self.assertRaises(ValueError) as failure:
+                manager.start(port=port)
+            self.assertIn("1 đến 65535", str(failure.exception))
+        self.assertEqual((manager.port, manager.is_running), (8080, False))
+
+    def test_importing_lan_server_does_not_open_database(self):
+        import subprocess
+        import sys
+        code = "import src.server.lan_server as s; print(s.db_manager is None)"
+        output = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                cwd=Path(__file__).resolve().parent, check=True).stdout
+        self.assertEqual(output.strip().splitlines()[-1], "True")
 
     def test_full_commit_wires_source_table_and_syncs_confirmed_edits(self):
         folder = self.root / "YenBai" / "HOP 49" / "HO SO 116"
@@ -136,11 +178,13 @@ class ExcelV3Test(unittest.TestCase):
         people = table_citizens(source)
         people[0]["license_number"] = "AP014549"
         db = DatabaseManager(str(self.root / "full.db"))
+        original_bytes = pdf.read_bytes()
         with patch("src.pipeline.DatabaseManager", return_value=db):
             result = commit_dossier(str(pdf), "15.368.25.09.2015", self.meta, people, source_tables=[source])
         self.assertIsNone(result["db_error"])
         self.assertEqual(db.search("AP014549")[0]["page_number"], 2)
-        self.assertEqual(Path(result["pdf_path"]).read_bytes(), pdf.read_bytes())
+        self.assertEqual(Path(result["pdf_path"]).read_bytes(), original_bytes)
+        self.assertFalse(pdf.exists(), "the scan is renamed, not copied")
         workbook = openpyxl.load_workbook(result["excel_path"])
         try:
             self.assertEqual(workbook.active["C6"].value, "AP014549")
@@ -148,6 +192,57 @@ class ExcelV3Test(unittest.TestCase):
             self.assertEqual(workbook.active["E6"].value, 2)
         finally:
             workbook.close()
+
+    def test_digitized_qdtt_summary_uses_signing_date_and_exam_date_stays_in_database(self):
+        folder = self.root / "YenBai" / "HOP 49" / "HO SO 116"
+        folder.mkdir(parents=True)
+        pdf = self.pdf("original.pdf", folder=folder)
+        source = table([("Họ và tên", "full_name"), ("Năm sinh", "birth_year"), ("Số GPLX", "license_number")],
+                       [row(["Nguyễn Văn A", "1981", "AP014542"], 2, code="AP014542", state="valid")])
+        meta = {**self.meta, "exam_date": "15/09/2015", "decision_number": "368", "decision_date": "25/09/2015",
+                "dossier_group": "QĐTT"}
+        db = DatabaseManager(str(self.root / "qdtt.db"))
+        with patch("src.pipeline.DatabaseManager", return_value=db):
+            result = commit_dossier(str(pdf), "15.368.25.09.2015", meta, table_citizens(source), source_tables=[source])
+        workbook = openpyxl.load_workbook(result["master_summary_path"])
+        try:
+            self.assertEqual(workbook.active["C3"].value.strftime("%d/%m/%Y"), "25/09/2015")
+        finally:
+            workbook.close()
+        self.assertEqual(db.get_all_dossiers()[0]["exam_date"], "15/09/2015")
+
+    def test_existing_excel_of_another_file_is_not_overwritten(self):
+        folder = self.root / "YenBai" / "HOP 49" / "HO SO 116"
+        folder.mkdir(parents=True)
+        pdf = self.pdf("original.pdf", folder=folder)
+        stray = folder / "15.368.25.09.2015.xlsx"
+        stray.write_bytes(b"made by hand")
+        source = table([("Họ và tên", "full_name"), ("Số GPLX", "license_number")],
+                       [row(["Nguyễn Văn A", "AP014542"], 2, code="AP014542", state="valid")])
+        db = DatabaseManager(str(self.root / "stray.db"))
+        with patch("src.pipeline.DatabaseManager", return_value=db), self.assertRaisesRegex(FileExistsError, "Excel"):
+            commit_dossier(str(pdf), "15.368.25.09.2015", self.meta, table_citizens(source), source_tables=[source])
+        self.assertEqual(stray.read_bytes(), b"made by hand")
+        self.assertTrue(pdf.exists(), "the scan keeps its name")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["15.368.25.09.2015.xlsx", "original.pdf"])
+        self.assertEqual(db.get_all_dossiers(), [])
+
+        # The dossier's own Excel (same name as its PDF) is still replaced when it is saved again.
+        stray.unlink()
+        with patch("src.pipeline.DatabaseManager", return_value=db):
+            first = commit_dossier(str(pdf), "15.368.25.09.2015", self.meta, table_citizens(source), source_tables=[source])
+            again = commit_dossier(first["pdf_path"], "15.368.25.09.2015", self.meta, table_citizens(source),
+                                   source_tables=[source])
+        self.assertEqual(again["excel_path"], first["excel_path"])
+        # Saving it under a new name is refused when that name's Excel belongs to another file.
+        other = folder / "15.369.25.09.2015.xlsx"
+        other.write_bytes(b"other")
+        with patch("src.pipeline.DatabaseManager", return_value=db), self.assertRaises(FileExistsError):
+            commit_dossier(again["pdf_path"], "15.369.25.09.2015", self.meta, table_citizens(source),
+                           source_tables=[source])
+        self.assertEqual(other.read_bytes(), b"other")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["15.368.25.09.2015.pdf", "15.368.25.09.2015.xlsx", "15.369.25.09.2015.xlsx"])
 
     def test_invalid_page_and_duplicate_filename_do_not_replace_indexed_record(self):
         original = self.pdf("registered.pdf")

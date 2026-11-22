@@ -25,31 +25,43 @@ class PDFViewerFrame(ctk.CTkFrame):
         self._build_ui()
 
     def _build_ui(self):
-        # 1. Top Toolbar
-        self.toolbar = ctk.CTkFrame(self, height=40, fg_color=("gray85", "gray20"))
+        # 1. Top Toolbar: page navigation on the first row, view controls on the second,
+        # so every button stays visible at the pane's default width.
+        self.toolbar = ctk.CTkFrame(self, fg_color=("gray85", "gray20"))
         self.toolbar.pack(fill="x", padx=4, pady=(4, 2))
+        nav_row = ctk.CTkFrame(self.toolbar, fg_color="transparent")
+        nav_row.pack(fill="x")
+        tool_row = ctk.CTkFrame(self.toolbar, fg_color="transparent")
+        tool_row.pack(fill="x")
 
-        self.btn_prev = ctk.CTkButton(self.toolbar, text="◀ Trang trước", width=95, height=28, command=self.prev_page)
-        self.btn_prev.pack(side="left", padx=4, pady=4)
+        self.btn_first = ctk.CTkButton(nav_row, text="⏮ Trang đầu", width=90, height=28, command=self.first_page)
+        self.btn_first.pack(side="left", padx=(4, 2), pady=4)
 
-        self.lbl_page = ctk.CTkLabel(self.toolbar, text="Trang 0 / 0", font=("Segoe UI", 12, "bold"))
-        self.lbl_page.pack(side="left", padx=10, pady=4)
+        self.btn_prev = ctk.CTkButton(nav_row, text="◀ Trang trước", width=95, height=28, command=self.prev_page)
+        self.btn_prev.pack(side="left", padx=2, pady=4)
 
-        self.btn_next = ctk.CTkButton(self.toolbar, text="Trang sau ▶", width=95, height=28, command=self.next_page)
-        self.btn_next.pack(side="left", padx=4, pady=4)
+        self.lbl_page = ctk.CTkLabel(nav_row, text="Trang 0 / 0", font=("Segoe UI", 12, "bold"))
+        self.lbl_page.pack(side="left", padx=8, pady=4)
 
-        # Zoom & Rotate Controls
-        self.btn_zoom_out = ctk.CTkButton(self.toolbar, text="🔍 -", width=45, height=28, command=self.zoom_out)
-        self.btn_zoom_out.pack(side="right", padx=3, pady=4)
+        self.btn_next = ctk.CTkButton(nav_row, text="Trang sau ▶", width=95, height=28, command=self.next_page)
+        self.btn_next.pack(side="left", padx=2, pady=4)
 
-        self.lbl_zoom = ctk.CTkLabel(self.toolbar, text="100%", font=("Segoe UI", 11))
-        self.lbl_zoom.pack(side="right", padx=4, pady=4)
+        self.btn_last = ctk.CTkButton(nav_row, text="Trang cuối ⏭", width=90, height=28, command=self.last_page)
+        self.btn_last.pack(side="left", padx=2, pady=4)
 
-        self.btn_zoom_in = ctk.CTkButton(self.toolbar, text="🔍 +", width=45, height=28, command=self.zoom_in)
-        self.btn_zoom_in.pack(side="right", padx=3, pady=4)
+        # Zoom & Rotate Controls (left-aligned)
+        self.btn_rotate = ctk.CTkButton(tool_row, text="🔄 Xoay", width=65, height=28, command=self.rotate_page)
+        self.btn_rotate.pack(side="left", padx=(4, 6), pady=(0, 4))
 
-        self.btn_rotate = ctk.CTkButton(self.toolbar, text="🔄 Xoay", width=65, height=28, command=self.rotate_page)
-        self.btn_rotate.pack(side="right", padx=6, pady=4)
+        self.btn_zoom_in = ctk.CTkButton(tool_row, text="🔍 +", width=45, height=28, command=self.zoom_in)
+        self.btn_zoom_in.pack(side="left", padx=3, pady=(0, 4))
+
+        self.lbl_zoom = ctk.CTkLabel(tool_row, text="100%", font=("Segoe UI", 11))
+        self.lbl_zoom.pack(side="left", padx=4, pady=(0, 4))
+
+        self.btn_zoom_out = ctk.CTkButton(tool_row, text="🔍 -", width=45, height=28, command=self.zoom_out)
+        self.btn_zoom_out.pack(side="left", padx=3, pady=(0, 4))
+        self._update_nav_buttons()
 
         # 2. Canvas Container with Horizontal & Vertical Scrollbars
         self.canvas_container = ctk.CTkFrame(self, fg_color="transparent")
@@ -140,9 +152,15 @@ class PDFViewerFrame(ctk.CTkFrame):
 
         # Update labels and button states
         self.lbl_page.configure(text=f"Trang {self.current_page_idx + 1} / {self.total_pages}")
-        self.lbl_zoom.configure(text=f"{int(self.zoom_level * 100)}%")
-        self.btn_prev.configure(state="normal" if self.current_page_idx > 0 else "disabled")
-        self.btn_next.configure(state="normal" if self.current_page_idx < self.total_pages - 1 else "disabled")
+        self.lbl_zoom.configure(text=f"{round(self.zoom_level * 100)}%")
+        self._update_nav_buttons()
+
+    def _update_nav_buttons(self):
+        has_previous = self.pdf_doc is not None and self.current_page_idx > 0
+        has_next = self.pdf_doc is not None and self.current_page_idx < self.total_pages - 1
+        for button, enabled in ((self.btn_first, has_previous), (self.btn_prev, has_previous),
+                                (self.btn_next, has_next), (self.btn_last, has_next)):
+            button.configure(state="normal" if enabled else "disabled")
 
     def close_pdf(self):
         if self.pdf_doc:
@@ -161,8 +179,13 @@ class PDFViewerFrame(ctk.CTkFrame):
         self.canvas.create_text(200, 150, text="Chưa nạp tệp PDF scan", font=("Segoe UI", 13, "italic"), fill="gray")
         self.canvas.configure(scrollregion=(0, 0, 0, 0))
         self.lbl_page.configure(text="Trang 0 / 0")
-        self.btn_prev.configure(state="disabled")
-        self.btn_next.configure(state="disabled")
+        self._update_nav_buttons()
+
+    def first_page(self):
+        self.go_to_page(1)
+
+    def last_page(self):
+        self.go_to_page(self.total_pages)
 
     def prev_page(self):
         if self.current_page_idx > 0:
@@ -182,12 +205,12 @@ class PDFViewerFrame(ctk.CTkFrame):
 
     def zoom_in(self):
         if self.zoom_level < 2.5:
-            self.zoom_level += 0.2
+            self.zoom_level = round(self.zoom_level + 0.1, 2)
             self._render_current_page()
 
     def zoom_out(self):
         if self.zoom_level > 0.4:
-            self.zoom_level -= 0.2
+            self.zoom_level = round(self.zoom_level - 0.1, 2)
             self._render_current_page()
 
     def rotate_page(self):

@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import re
+import unicodedata
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,17 +39,28 @@ PROVINCE_CODES_FILE = get_resource_path(os.path.join("data", "province_codes.jso
 DEFAULT_INPUT_DIR = os.path.join(BASE_DIR, "DuLieu_GPLX", "01_ChuaXuLy")
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "DuLieu_GPLX", "02_DaXuLy_HoanThanh")
 DEFAULT_ERROR_DIR = os.path.join(BASE_DIR, "DuLieu_GPLX", "03_CoLoi_CanXemLai")
+def _handover_root(base_dir: str) -> str:
+    parent = os.path.dirname(base_dir)
+    if os.path.basename(base_dir).lower() == "app" or os.path.basename(parent).lower() == "so hoa gplx":
+        return parent
+    return os.path.join(base_dir, "So Hoa GPLX")
+
+
 if getattr(sys, "frozen", False):
-    # Keep writable application data outside the extracted package. This lets
-    # customers run the app from any folder, including locations that need
-    # elevated rights to modify.
-    USER_DATA_DIR = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    USER_DATA_DIR = os.path.join(USER_DATA_DIR, "GPLX")
-    DATABASE_PATH = os.path.join(USER_DATA_DIR, "HeThong", "gplx_index.db")
-    BUNDLED_DATABASE_SEED_PATH = os.path.join(BASE_DIR, "HeThong", "gplx_index.db")
+    # The packaged app is opened from the host's shared "So Hoa GPLX" folder, so every
+    # machine uses the same database next to the archive. Older builds kept a private copy
+    # in LocalAppData; it seeds the shared database once when the shared file is missing.
+    DATABASE_PATH = os.path.join(_handover_root(BASE_DIR), "HeThong", "gplx_index.db")
+    LEGACY_DATABASE_PATHS = [
+        os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GPLX", "HeThong", "gplx_index.db"),
+        os.path.join(BASE_DIR, "HeThong", "gplx_index.db"),
+    ]
 else:
     DATABASE_PATH = os.path.join(BASE_DIR, "HeThong", "gplx_index.db")
-    BUNDLED_DATABASE_SEED_PATH = None
+    LEGACY_DATABASE_PATHS = []
+DATABASE_BACKUP_DIR = os.path.join(os.path.dirname(DATABASE_PATH), "SaoLuu")
+# Window layout (pane widths) of this machine: each screen differs, so it is not shared with the database.
+UI_SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GPLX", "giao_dien.json")
 
 # Regex pattern for License Numbers:
 # Historical licenses usually start with 1-2 letters (A, B, C, AM,...) followed by 5-7 digits
@@ -73,6 +85,13 @@ def load_province_codes():
     return []
 
 PROVINCE_CODES = load_province_codes()
+# Whole-word matching: "huế" must not match inside "thuế".
+_PROVINCE_PATTERNS = [
+    (prov["code"], re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(unicodedata.normalize("NFC", kw).lower()) for kw in prov["keywords"]) + r")(?!\w)"
+    ))
+    for prov in PROVINCE_CODES if prov.get("keywords")
+]
 
 def find_province_code_by_text(text: str) -> str:
     """
@@ -82,8 +101,8 @@ def find_province_code_by_text(text: str) -> str:
     if not text:
         return ""
     
-    text_lower = text.lower()
-    matches = {prov["code"] for prov in PROVINCE_CODES if any(kw in text_lower for kw in prov.get("keywords", []))}
+    text_lower = unicodedata.normalize("NFC", text).lower()
+    matches = {code for code, pattern in _PROVINCE_PATTERNS if pattern.search(text_lower)}
     return next(iter(matches)) if len(matches) == 1 else ""
 
 def get_handover_root_dir() -> str:
@@ -92,10 +111,7 @@ def get_handover_root_dir() -> str:
     - Nếu app nằm trong '.../So Hoa GPLX/app': trả về '.../So Hoa GPLX'
     - Nếu chạy từ mã nguồn repo: trả về '[repo]/So Hoa GPLX'
     """
-    parent = os.path.dirname(BASE_DIR)
-    if os.path.basename(BASE_DIR).lower() == "app" or os.path.basename(parent).lower() == "so hoa gplx":
-        return parent
-    return os.path.join(BASE_DIR, "So Hoa GPLX")
+    return _handover_root(BASE_DIR)
 
 def get_default_dulieu_dir() -> str:
     """
@@ -135,34 +151,40 @@ def init_digitization_structure(root_dir: str = None) -> str:
 
     # 1. Tạo file Chay_Ngay.bat ở thư mục gốc So Hoa GPLX
     bat_path = os.path.join(root_dir, "Chay_Ngay.bat")
-    if not os.path.exists(bat_path):
-        bat_content = (
-            "@echo off\r\n"
-            "chcp 65001 >nul\r\n"
-            "title HỆ THỐNG SỐ HÓA & TRA CỨU GIẤY PHÉP LÁI XE\r\n"
-            "echo ========================================================\r\n"
-            "echo   HỆ THỐNG SỐ HÓA VÀ TRA CỨU GIẤY PHÉP LÁI XE (GPLX)\r\n"
-            "echo ========================================================\r\n"
-            "echo.\r\n"
-            "echo [*] Đang khởi động ứng dụng, vui lòng chờ trong giây lát...\r\n"
-            "cd /d \"%~dp0app\"\r\n"
-            "if exist \"GPLX_SoHoa_TraCuu.exe\" (\r\n"
-            "    start \"\" \"GPLX_SoHoa_TraCuu.exe\"\r\n"
-            ") else (\r\n"
-            "    if exist \"..\\app_desktop.py\" (\r\n"
-            "        python \"..\\app_desktop.py\"\r\n"
-            "    ) else (\r\n"
-            "        echo [!] Không tìm thấy GPLX_SoHoa_TraCuu.exe trong thư mục app.\r\n"
-            "        pause\r\n"
-            "    )\r\n"
-            ")\r\n"
-            "exit\r\n"
-        )
-        try:
-            with open(bat_path, "w", encoding="utf-8") as f:
+    # Client machines open this from a network share (\\server\...): cmd cannot "cd" into a UNC
+    # path, so the exe is started by its absolute path. "&" in the title must be escaped.
+    bat_content = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "title HỆ THỐNG SỐ HÓA ^& TRA CỨU GIẤY PHÉP LÁI XE\r\n"
+        "echo ========================================================\r\n"
+        "echo   HỆ THỐNG SỐ HÓA VÀ TRA CỨU GIẤY PHÉP LÁI XE (GPLX)\r\n"
+        "echo ========================================================\r\n"
+        "echo.\r\n"
+        "echo [*] Đang khởi động ứng dụng, vui lòng chờ trong giây lát...\r\n"
+        "set \"APP_DIR=%~dp0app\"\r\n"
+        "if exist \"%APP_DIR%\\GPLX_SoHoa_TraCuu.exe\" (\r\n"
+        "    start \"\" /D \"%APP_DIR%\" \"%APP_DIR%\\GPLX_SoHoa_TraCuu.exe\"\r\n"
+        ") else (\r\n"
+        "    if exist \"%~dp0app_desktop.py\" (\r\n"
+        "        python \"%~dp0app_desktop.py\"\r\n"
+        "    ) else (\r\n"
+        "        echo [!] Không tìm thấy GPLX_SoHoa_TraCuu.exe trong thư mục app.\r\n"
+        "        pause\r\n"
+        "    )\r\n"
+        ")\r\n"
+        "exit\r\n"
+    )
+    try:
+        current = None
+        if os.path.exists(bat_path):
+            with open(bat_path, encoding="utf-8", errors="replace", newline="") as f:
+                current = f.read()
+        if current != bat_content:
+            with open(bat_path, "w", encoding="utf-8", newline="") as f:
                 f.write(bat_content)
-        except OSError:
-            logger.exception("Could not create startup script at %s", bat_path)
+    except OSError:
+        logger.exception("Could not create startup script at %s", bat_path)
 
     # Shortcut to open the latest readable application log.
     log_viewer_path = os.path.join(root_dir, "Xem_Nhat_Ky.bat")
@@ -209,7 +231,7 @@ def init_digitization_structure(root_dir: str = None) -> str:
 
     # 4. Tạo file hướng dẫn lưu trữ tại DuLieuSoHoa_GPLS
     readme_path = os.path.join(dulieu_dir, "HUONG_DAN_LUU_TRU.txt")
-    if not os.path.exists(readme_path):
+    if True:  # rewritten when the app's instructions change
         readme_content = (
             "====================================================================\r\n"
             "QUY TẮC LƯU TRỮ VÀ TỔ CHỨC FILE SCAN PDF SỐ HÓA GPLX\r\n"
@@ -220,19 +242,32 @@ def init_digitization_structure(root_dir: str = None) -> str:
             "   │   └── HOP_[Số_Hộp]/        (Ví dụ: HOP_01, HOP_02, ...)\r\n"
             "   │       └── HoSo_[Số_Hồ_Sơ]/ (Ví dụ: HoSo_01, HoSo_02, ...)\r\n"
             "   │           └── [Các file scan PDF]\r\n\r\n"
-            "2. HƯỚNG DẪN RÀ SOÁT VÀ ĐỔI TÊN PDF THEO THƯ MỤC:\r\n"
+            "2. ĐỔI TÊN FILE NHANH (CHỈ ĐỌC TRANG ĐẦU):\r\n"
             "   - Đặt các file PDF scan gốc vào thư mục HoSo tương ứng.\r\n"
             "   - Mở ứng dụng, chọn tab 'Số hóa & Đổi tên hồ sơ'.\r\n"
-            "   - Nhấn nút '📁 Đổi tên file (theo folder)'.\r\n"
-            "   - Chọn thư mục HoSo vừa đặt file PDF.\r\n"
-            "   - Chọn PDF ở cột trái, xem bản scan ở giữa và rà soát thông tin ở cột phải.\r\n"
-            "   - Bấm 'Xác nhận lưu PDF và sổ tổng hợp' sau khi kiểm tra tên đề xuất.\r\n"
-            "   - Ứng dụng giữ PDF gốc, lưu bản sao cạnh nguồn và cập nhật sổ tổng hợp của tỉnh.\r\n"
-            "   - Nếu sổ đang mở trong Excel, đóng sổ rồi xác nhận lại.\r\n"
+            "   - Nhấn nút '📑 Đổi tên file nhanh (chọn theo folder)' và chọn thư mục HoSo.\r\n"
+            "   - Ứng dụng đọc trang đầu để điền ngày và số quyết định; số GPLX đầu/cuối,\r\n"
+            "     tổng số GPLX, dãy số và nhận định do người dùng nhập.\r\n"
+            "   - Bấm 'Xác nhận lưu PDF và sổ tổng hợp' sau khi kiểm tra tên đề xuất.\r\n\r\n"
+            "3. SỐ HÓA ĐẦY ĐỦ:\r\n"
+            "   - Nhấn '📁 Chọn Thư mục Hồ sơ' hoặc '📄 Chọn File PDF lẻ', đọc OCR, rà soát bảng\r\n"
+            "     rồi xác nhận để đổi tên PDF, xuất Excel và cập nhật sổ tổng hợp.\r\n\r\n"
+            "4. LƯU Ý:\r\n"
+            "   - PDF được ĐỔI TÊN THẬT, không giữ file tên cũ. Tên cũ được ghi trong sheet ẩn\r\n"
+            "     _GPLX_Rename của sổ tổng hợp tỉnh.\r\n"
+            "   - Mỗi lần chọn thư mục/file, danh sách bên trái được làm mới. File đã lưu có dấu '✅ Xong'\r\n"
+            "     và vẫn mở được để sửa và lưu lại.\r\n"
+            "   - Nếu sổ tổng hợp đang mở trong Excel, đóng sổ rồi xác nhận lại.\r\n"
+            "   - Không mở PDF đang đổi tên bằng chương trình khác (kể cả trên máy khác).\r\n"
         )
         try:
-            with open(readme_path, "w", encoding="utf-8") as f:
-                f.write(readme_content)
+            current = None
+            if os.path.exists(readme_path):
+                with open(readme_path, encoding="utf-8", errors="replace", newline="") as f:
+                    current = f.read()
+            if current != readme_content:
+                with open(readme_path, "w", encoding="utf-8", newline="") as f:
+                    f.write(readme_content)
         except OSError:
             logger.exception("Could not create storage instructions at %s", readme_path)
 

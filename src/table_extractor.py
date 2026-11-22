@@ -9,7 +9,7 @@ import numpy as np
 
 from src.naming_rules import LICENSE_NUMBER
 from src.sequence_analyzer import split_prefix_and_num
-from src.vietnamese_utils import restore_vietnamese_name, normalize_vietnamese_address, normalize_nationality
+from src.vietnamese_utils import clean_vietnamese_name, normalize_vietnamese_address, normalize_nationality
 
 
 def _key(text):
@@ -29,7 +29,10 @@ _HEADINGS = {
     "signature": ("kynhan", "chuky"),
     "issue_date": ("ngaycap", "ngaycapgplx"),
     "license_class": ("hang", "hanggplx", "hangbang"),
-    "register_index": ("sottbangke", "s6ttbangke", "sttbangke", "sobangke", "sotthoso", "masohoso", "mahoso"),
+    "register_index": (
+        "sottbangke", "s6ttbangke", "sttbangke", "sobangke", "sotthoso", "masohoso", "mahoso",
+        "ttbke", "ttbangke", "bke", "ttbk", "sottbk", "sottbke", "sttbke", "bangke",
+    ),
     "identity": ("cccd", "cmnd", "socccd", "socmnd", "dinhdanhcanhan", "sodinhdanhcanhan", "socancuoc"),
     "expiry_date": ("ngayhethan", "ngayhethieuluc", "ngayhieuluc"),
     "return_date": ("ngaytra",),
@@ -42,6 +45,15 @@ _MERGED = (
     ("sogplx", "ngaycap", "Số GPLX", "Ngày cấp"),
 )
 _LICENSE_CONFIDENCE = 0.70
+# Only lists with a name column and a birth column are read ("Họ và tên"/"Họ tên" and
+# "Năm sinh"/"Ngày sinh"/"Ngày tháng năm sinh"); other tables in the PDF are skipped.
+_BIRTH_HEADINGS = {"namsinh", "ngaysinh", "ngaythangnamsinh"}
+
+
+def is_citizen_list(columns):
+    return any(c["role"] == "full_name" for c in columns) and any(
+        c["role"] == "birth_year" and _key(c["label"]) in _BIRTH_HEADINGS for c in columns
+    )
 
 
 def source_column_role(label):
@@ -137,20 +149,37 @@ def _split_merged(box):
     if key in _ROLES:
         return [box]
     for first, second, label1, label2 in _MERGED:
-        if key.strip("il") == first + second:
+        # The cell border between the headings is often read as "|", "I", "l" or "1".
+        if re.fullmatch(rf"[il1]*{first}[il1]{{0,2}}{second}[il1]*", key):
             split = box.x0 + (box.x1 - box.x0) * len(first) / len(first + second)
             return [replace(box, text=label1, x1=split), replace(box, text=label2, x0=split)]
     return [box]
 
 
 def _license(text):
-    code = re.sub(r"\s+", "", text.upper()).strip(".,:;")
+    # NFKC turns full-width OCR punctuation ("：AH515423") into ASCII before stripping it.
+    code = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text).upper()).strip(".,:;")
     return code if LICENSE_NUMBER.fullmatch(code) else ""
+
+
+def _joined_rules(horizontal, gap=.05):
+    """Join collinear pieces of one printed rule that a scan defect broke apart."""
+    joined = []
+    for y, x0, x1 in sorted(horizontal, key=lambda line: (line[0], line[1])):
+        for i, (jy, jx0, jx1) in enumerate(joined):
+            if abs(jy - y) < .003 and x0 - jx1 < gap and jx0 - x1 < gap:
+                joined[i] = (jy, min(jx0, x0), max(jx1, x1))
+                break
+        else:
+            joined.append((y, x0, x1))
+    return joined
 
 
 def _header_columns(boxes, anchor, grid, left, right):
     height = anchor.y1 - anchor.y0
-    spanning = [y for y, x0, x1 in grid.horizontal if x0 <= anchor.x <= x1 and x1 - x0 >= min(.32, (right - left) * .65)]
+    # A rule may fade out right under the heading on a scan; a long rule ending near it still counts.
+    spanning = [y for y, x0, x1 in _joined_rules(grid.horizontal)
+                if x0 - .12 <= anchor.x <= x1 + .12 and x1 - x0 >= min(.32, (right - left) * .65)]
     below = [y for y in spanning if anchor.y1 - height * .10 <= y <= anchor.y1 + height * 1.75]
     above = [y for y in spanning if anchor.y0 - height * 1.75 <= y <= anchor.y0 + height * .10]
     top = max(above, default=anchor.y0 - height * 1.30)
@@ -160,7 +189,10 @@ def _header_columns(boxes, anchor, grid, left, right):
         and re.search(r"[A-Za-zÀ-ỹ]", box.text) and not _license(box.text) and not _key(box.text).startswith("trang")
         for part in _split_merged(box)
     ]
-    dividers = [x for x, start, end in grid.vertical if left <= x <= right and start < bottom + .035 and end > bottom + .065]
+    rules = [(x, end - start) for x, start, end in grid.vertical
+             if left <= x <= right and start < bottom + .035 and end > bottom + .065]
+    dividers = [x for x, _ in rules]
+    length = dict(rules)
     groups = []
     for box in sorted(candidates, key=lambda item: item.x):
         if groups:
@@ -183,7 +215,7 @@ def _header_columns(boxes, anchor, grid, left, right):
     positive = set(roles)
     if "full_name" not in positive or not (
         "license_number" in positive
-        or ("birth_year" in positive and bool(positive & {"address", "stt", "issue_date"}))
+        or ("birth_year" in positive and bool(positive & {"address", "stt", "issue_date", "register_index"}))
         or {"stt", "address"} <= positive
     ):
         return None
@@ -191,8 +223,9 @@ def _header_columns(boxes, anchor, grid, left, right):
     edges = [max((x for x in dividers if x < spans[0][0] + .005), default=left)]
     for (_, end), (start, _) in zip(spans, spans[1:]):
         midpoint = (end + start) / 2
+        # Text aligned down a column can look like a short rule; the printed rule runs the table's height.
         edges.append(min((x for x in dividers if end - .005 <= x <= start + .005),
-                         key=lambda x: abs(x - midpoint), default=midpoint))
+                         key=lambda x: (-round(length[x], 2), abs(x - midpoint)), default=midpoint))
     edges.append(min((x for x in dividers if x > spans[-1][1] - .005), default=right))
     if any(a >= b for a, b in zip(edges, edges[1:])):
         return None
@@ -201,6 +234,23 @@ def _header_columns(boxes, anchor, grid, left, right):
         for label, role, x0, x1 in zip(labels, roles, edges, edges[1:])
     ]
     return bottom, columns
+
+
+def _name_anchors(boxes):
+    """Boxes reading "Họ và tên"/"Họ tên", including a heading wrapped over two lines
+    ("Họ" above "và tên"), which OCR returns as two boxes."""
+    anchors = [box for box in boxes if _ROLES.get(_key(box.text)) == "full_name"]
+    for top in boxes:
+        if _key(top.text) not in ("ho", "hova"):
+            continue
+        height = top.y1 - top.y0
+        for below in boxes:
+            if (below is not top and -height * .3 <= below.y0 - top.y1 <= height * .8
+                    and min(top.x1, below.x1) - max(top.x0, below.x0) > 0
+                    and _ROLES.get(_key(top.text + below.text)) == "full_name"):
+                anchors.append(Box(f"{top.text} {below.text}", min(top.score, below.score),
+                                   min(top.x0, below.x0), top.y0, max(top.x1, below.x1), below.y1))
+    return anchors
 
 
 def _name(text):
@@ -222,13 +272,27 @@ def _read_rows(boxes, columns, start, end, grid, page_number):
     register_index = roles.index("register_index") if "register_index" in roles else None
     license_index = roles.index("license_number") if roles.count("license_number") == 1 else None
     boxes = [b for b in boxes if start <= b.y < end and columns[0]["left"] <= b.x < columns[-1]["right"]]
-    totals = [b.y0 for b in boxes if _key(b.text) in {"tongcong", "cong", "congdon", "tongso"} or _other_section(b.text)]
+    def list_continues_below(marker):
+        # OCR drops accents, so a wrapped name ending in "Công" reads like a "Cộng" total.
+        return any(b.y > marker.y1 and (_license(b.text) or (
+            stt_index is not None and in_column(b, columns[stt_index]) and re.fullmatch(r"[0-9]{1,4}[.)]?", b.text)))
+            for b in boxes)
+
+    totals = [b.y0 for b in boxes if _other_section(b.text) or (
+        _key(b.text) in {"tongcong", "cong", "congdon", "tongso"} and not list_continues_below(b))]
     if totals:
         end = min(end, min(totals))
         boxes = [b for b in boxes if b.y < end]
     if not boxes:
         return []
     glyph = median(b.y1 - b.y0 for b in boxes)
+    rules = [y for y, a, b in grid.horizontal if b - a >= (columns[-1]["right"] - columns[0]["left"]) * .42
+             and a < columns[name_index]["right"]]
+    def own_data(other):
+        # Values that belong to one person; a wrapped address line has none of them.
+        return _license(other.text) or any(
+            in_column(other, c) and re.fullmatch(r"[0-9]{4}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}", other.text)
+            for c in columns if c["role"] in {"birth_year", "issue_date"})
     names = sorted((b for b in boxes if in_column(b, columns[name_index]) and _name(b.text)), key=lambda b: b.y)
     entries = []
     for b in names:
@@ -246,7 +310,8 @@ def _read_rows(boxes, columns, start, end, grid, page_number):
         if (has_index or has_data or (len(columns) == 2 and "license_number" in roles)) and (
             not entries or b.y - entries[-1][0].y > glyph * .67
         ):
-            entries.append((b, b.score >= .62))
+            weak = license_index is not None and not has_index and not any(map(own_data, aligned))
+            entries.append((b, b.score >= .62, weak))
     anchors = (
         (stt_index, lambda text: re.fullmatch(r"[0-9]{1,4}[.)]?", text), 0),
         (register_index, lambda text: re.fullmatch(r"[0-9]{4,12}", text), .70),
@@ -258,32 +323,31 @@ def _read_rows(boxes, columns, start, end, grid, page_number):
         for box in boxes:
             if not in_column(box, columns[index]) or box.score < confidence or not is_anchor(box.text):
                 continue
-            if any(abs(entry.y - box.y) <= glyph for entry, _ in entries):
+            if any(abs(entry.y - box.y) <= glyph for entry, _, _ in entries):
                 continue
-            if any(other is not box and abs(other.y - box.y) <= glyph and (
-                _license(other.text) or any(in_column(other, c) and re.fullmatch(r"[0-9]{4}", other.text)
-                                            for c in columns if c["role"] == "birth_year")
-            ) for other in boxes):
-                entries.append((box, False))
+            if any(other is not box and abs(other.y - box.y) <= glyph and own_data(other) for other in boxes):
+                entries.append((box, False, False))
+    entries.sort(key=lambda item: item[0].y)
+    # A name line with only address text and no rule above it is the previous person's wrapped line.
+    entries = [entry for i, entry in enumerate(entries) if not (
+        entry[2] and i and not any(entries[i - 1][0].y < y < entry[0].y for y in rules))]
     if not entries:
         return []
-
-    entries.sort(key=lambda item: item[0].y)
-    centers = [b.y for b, _ in entries]
+    centers = [b.y for b, _, _ in entries]
     gaps = [b - a for a, b in zip(centers, centers[1:])]
     typical = median(gaps) if gaps else glyph * 2
-    rules = [y for y, a, b in grid.horizontal if b - a >= (columns[-1]["right"] - columns[0]["left"]) * .42
-             and a < columns[name_index]["right"]]
     def boundary(a, b):
         midpoint = (a + b) / 2
         return min((y for y in rules if a < y < b), key=lambda y: abs(y - midpoint), default=midpoint)
 
     top_edge = max((y for y in rules if start <= y < centers[0] and centers[0] - y <= typical), default=start)
-    bottom_edge = min((y for y in rules if centers[-1] < y <= end and y - centers[-1] <= typical),
+    # A rule through the last text line (a scan streak) is not that row's bottom edge.
+    last_line = max(b.y for b in boxes if abs(b.y - centers[-1]) <= glyph * .66)
+    bottom_edge = min((y for y in rules if last_line < y <= end and y - centers[-1] <= typical),
                       default=min(end, centers[-1] + max(typical * .65, glyph)))
     row_edges = [top_edge, *(boundary(a, b) for a, b in zip(centers, centers[1:])), bottom_edge]
     rows = []
-    for i, (_, confident) in enumerate(entries):
+    for i, (_, confident, _) in enumerate(entries):
         y0, y1 = row_edges[i:i+2]
         cells, scores, bounds = [], [], []
         for column in columns:
@@ -299,7 +363,243 @@ def _read_rows(boxes, columns, start, end, grid, page_number):
     return rows
 
 
+def split_camel_case(s: str) -> str:
+    """Insert a space between lowercase and uppercase letters in joined words (e.g. HaVanHai -> Ha Van Hai)."""
+    res = []
+    for i, ch in enumerate(s):
+        if i > 0 and ch.isupper() and s[i - 1].islower():
+            res.append(" ")
+        res.append(ch)
+    return "".join(res)
+
+
+# A register code is 4-10 digits. OCR may put a stray mark before it ("I 201061", "|201063")
+# and "/" or ":" between it and the name ("201062/Vu Duc Cong").
+_LEAD = r"[:;.\s\-/(|]*(?:[Il|]\s*)?"
+_GAP = r"\s*[-:(/\s]*\s*"
+_RE_STT = re.compile(r"^([0-9]{1,4})[.)]?$")
+_RE_STT_AND_CODE = re.compile(r"^([0-9]{1,4})[.)\-]?\s+([0-9]{4,10})$")
+_RE_CODE_AND_NAME = re.compile(rf"^{_LEAD}([0-9]{{4,10}}){_GAP}([A-Za-zÀ-ỹ].*)$")
+# A cell holding "STT code Family" or "code Family": the first words of the name were read into it.
+_RE_STT_CODE_AND_NAME = re.compile(rf"^(?:([0-9]{{1,4}})[.)\-]?\s+)?{_LEAD}([0-9]{{4,10}}){_GAP}([A-Za-zÀ-ỹ].*)$")
+
+
+def _clean_name(name):
+    name = split_camel_case(name)
+    name = re.sub(r"^[:;.\s\-/(|]+", "", name)
+    return re.sub(r"[:;.\s\-/)\]|]+$", "", name).strip()
+
+
+def _join_name(head, rest):
+    return _clean_name(f"{head} {rest}".strip())
+
+
+def _keep_review(row, name, guessed):
+    """The OCR doubt about a name survives the split.
+
+    A name whose first words were found in another column, or a name of one word, is a guess
+    of where the name starts: the row is shown for review (yellow) until someone checks it.
+    """
+    row["identity_confident"] = (
+        bool(row.get("identity_confident", True)) and bool(name) and not guessed and len(name.split()) > 1
+    )
+
+
+def _recover_missing_columns(rows, columns):
+    """Recover missing STT or register index columns when OCR drops column headers.
+
+    Handles cases where:
+    1. STT column header was missed by OCR, so Col 0 has STT numbers (69..80), and
+       register numbers (201117..201128) are prepended to names in full_name or joined
+       with STT in Col 0 (e.g. '76 201124', or '28 201076 Tran Quy' with the name's first words).
+       Reconstructs separate STT and TT B.Kê columns.
+    2. TT B.Kê column header was missed by OCR, so full_name has register numbers prepended.
+    3. Both columns exist, but individual rows merged register numbers into full_name, or
+       the first words of the name into TT B.Kê.
+    """
+    if not rows or not columns:
+        return
+
+    roles = [c.get("role") for c in columns]
+    if "full_name" not in roles:
+        return
+    name_idx = roles.index("full_name")
+
+    has_stt = "stt" in roles
+    has_reg = "register_index" in roles
+
+    if has_stt and has_reg:
+        reg_idx = roles.index("register_index")
+        for row in rows:
+            cells = row.get("cells", [])
+            if len(cells) <= max(reg_idx, name_idx):
+                continue
+            c_reg = cells[reg_idx].strip()
+            c_name = cells[name_idx].strip()
+            m_reg = _RE_CODE_AND_NAME.match(c_reg)
+            if m_reg:
+                cells[reg_idx] = m_reg.group(1)
+                cells[name_idx] = _join_name(m_reg.group(2), c_name)
+                _keep_review(row, cells[name_idx], guessed=True)
+            elif not c_reg:
+                m = _RE_CODE_AND_NAME.match(c_name)
+                if m:
+                    cells[reg_idx] = m.group(1)
+                    cells[name_idx] = _clean_name(m.group(2))
+                    _keep_review(row, cells[name_idx], guessed=False)
+                elif _RE_STT_AND_CODE.match(cells[0].strip()):
+                    m_both = _RE_STT_AND_CODE.match(cells[0].strip())
+                    cells[0] = m_both.group(1)
+                    row["stt"] = int(m_both.group(1))
+                    cells[reg_idx] = m_both.group(2)
+        return
+
+    n = len(rows)
+    stt_in_col0 = 0
+    code_in_table = 0
+
+    for row in rows:
+        cells = row.get("cells", [])
+        if not cells:
+            continue
+        c0 = cells[0].strip()
+        c_name = cells[name_idx].strip() if len(cells) > name_idx else ""
+        merged = bool(_RE_STT_CODE_AND_NAME.match(c0))
+        if _RE_STT.match(c0) or _RE_STT_AND_CODE.match(c0) or merged:
+            stt_in_col0 += 1
+        if _RE_STT_AND_CODE.match(c0) or merged or _RE_CODE_AND_NAME.match(c_name):
+            code_in_table += 1
+
+    code_ratio = code_in_table / n
+    stt_col0_ratio = stt_in_col0 / n
+
+    if code_ratio < 0.30:
+        return
+
+    if not has_stt and stt_col0_ratio >= 0.50:
+        col0 = columns[0]
+        col0_left = col0["left"]
+        col0_right = col0["right"]
+        mid = col0_left + (col0_right - col0_left) * 0.40
+
+        reg_label = col0.get("label") or "TT B.Kê"
+        if _key(reg_label) in _HEADINGS.get("stt", ()):
+            reg_label = "TT B.Kê"
+
+        stt_col = {"label": "STT", "role": "stt", "left": col0_left, "right": mid}
+        reg_col = {"label": reg_label, "role": "register_index", "left": mid, "right": col0_right}
+        new_columns = [stt_col, reg_col] + list(columns[1:])
+
+        for row in rows:
+            cells = row.get("cells", [])
+            c0 = cells[0].strip() if len(cells) > 0 else ""
+            c_name = cells[name_idx].strip() if len(cells) > name_idx else ""
+
+            stt_str = ""
+            reg_str = ""
+            name_str = c_name
+            guessed = False
+
+            m_both = _RE_STT_AND_CODE.match(c0)
+            m_merged = None if m_both else _RE_STT_CODE_AND_NAME.match(c0)
+            if m_both:
+                stt_str = m_both.group(1)
+                reg_str = m_both.group(2)
+            elif m_merged:
+                stt_str = m_merged.group(1) or ""
+                reg_str = m_merged.group(2)
+                name_str = f"{m_merged.group(3)} {c_name}"
+                guessed = True
+            else:
+                m_stt = _RE_STT.match(c0)
+                stt_str = m_stt.group(1) if m_stt else c0
+                m_code_name = _RE_CODE_AND_NAME.match(c_name)
+                if m_code_name:
+                    reg_str = m_code_name.group(1)
+                    name_str = m_code_name.group(2)
+
+            name_str = _clean_name(name_str)
+
+            row["stt"] = int(stt_str) if stt_str.isdigit() else None
+
+            new_cells = [stt_str, reg_str] + list(cells[1:])
+            new_cells[name_idx + 1] = name_str
+            row["cells"] = new_cells
+
+            if "scores" in row and row["scores"]:
+                s0 = row["scores"][0]
+                row["scores"] = [s0, s0] + list(row["scores"][1:])
+            if "bounds" in row and row["bounds"]:
+                b0 = row["bounds"][0]
+                b_mid = (b0[0] + b0[2]) / 2
+                row["bounds"] = [(b0[0], b0[1], b_mid, b0[3]), (b_mid, b0[1], b0[2], b0[3])] + list(row["bounds"][1:])
+            _keep_review(row, name_str, guessed)
+
+        columns[:] = new_columns
+        return
+
+    if has_stt and not has_reg and code_ratio >= 0.30:
+        name_col = columns[name_idx]
+        name_left = name_col["left"]
+        name_right = name_col["right"]
+        mid = name_left + (name_right - name_left) * 0.35
+
+        reg_col = {"label": "TT B.Kê", "role": "register_index", "left": name_left, "right": mid}
+        new_name_col = {**name_col, "left": mid}
+
+        new_columns = list(columns[:name_idx]) + [reg_col, new_name_col] + list(columns[name_idx + 1:])
+
+        for row in rows:
+            cells = row.get("cells", [])
+            c_name = cells[name_idx].strip() if len(cells) > name_idx else ""
+            c0 = cells[0].strip() if len(cells) > 0 else ""
+
+            reg_str = ""
+            name_str = c_name
+            guessed = False
+
+            m_both = _RE_STT_AND_CODE.match(c0)
+            m_merged = None if m_both else _RE_STT_CODE_AND_NAME.match(c0)
+            if m_both:
+                cells[0] = m_both.group(1)
+                row["stt"] = int(m_both.group(1))
+                reg_str = m_both.group(2)
+            elif m_merged and m_merged.group(1):
+                cells[0] = m_merged.group(1)
+                row["stt"] = int(m_merged.group(1))
+                reg_str = m_merged.group(2)
+                name_str = f"{m_merged.group(3)} {c_name}"
+                guessed = True
+            else:
+                m_code_name = _RE_CODE_AND_NAME.match(c_name)
+                if m_code_name:
+                    reg_str = m_code_name.group(1)
+                    name_str = m_code_name.group(2)
+
+            name_str = _clean_name(name_str)
+
+            new_cells = list(cells[:name_idx]) + [reg_str, name_str] + list(cells[name_idx + 1:])
+            row["cells"] = new_cells
+
+            if "scores" in row and row["scores"]:
+                s_name = row["scores"][name_idx] if len(row["scores"]) > name_idx else 1.0
+                row["scores"] = list(row["scores"][:name_idx]) + [s_name, s_name] + list(row["scores"][name_idx + 1:])
+            if "bounds" in row and row["bounds"]:
+                b_name = row["bounds"][name_idx] if len(row["bounds"]) > name_idx else (0, 0, 0, 0)
+                b_mid = (b_name[0] + b_name[2]) / 2
+                row["bounds"] = (
+                    list(row["bounds"][:name_idx])
+                    + [(b_name[0], b_name[1], b_mid, b_name[3]), (b_mid, b_name[1], b_name[2], b_name[3])]
+                    + list(row["bounds"][name_idx + 1:])
+                )
+            _keep_review(row, name_str, guessed)
+
+        columns[:] = new_columns
+        return
+
+
 def _finish_rows(rows, columns, grid):
+    _recover_missing_columns(rows, columns)
     roles = [c["role"] for c in columns]
     valid_columns = [i for i, role in enumerate(roles) if role == "license_number"]
     inferred = False
@@ -385,10 +685,28 @@ class LicenseTableExtractor:
     def __init__(self):
         self.tables = []
         self.previous_columns = None
+        # True after a table without the required columns; its unlabeled follow-up pages are skipped.
+        self.skipping = False
+
+    def _read_repeated_header(self, boxes, columns, start, end, grid, page_number):
+        """Read a page with the previous list's columns when its heading repeats that list.
+
+        A repeated heading is often scanned worse than the first one, so its own column edges
+        can be off. Returns (columns, rows) when those rows continue the list, otherwise None.
+        """
+        if not self.tables or not _same_layout(self.tables[-1]["columns"], columns):
+            return None
+        table = self.tables[-1]
+        layout = [dict(c) for c in _align_columns(table["columns"], grid)]
+        rows = _read_rows(boxes, layout, start, end, grid, page_number)
+        if not rows:
+            return None
+        _finish_rows(rows, layout, grid)
+        return (layout, rows) if _continues(table, rows, page_number) else None
 
     def read_page(self, ocr_result, size, grid, page_number):
         boxes = _boxes(ocr_result, size)
-        anchors = sorted((box for box in boxes if _ROLES.get(_key(box.text)) == "full_name"), key=lambda b: (b.y, b.x))
+        anchors = sorted(_name_anchors(boxes), key=lambda b: (b.y, b.x))
         bands = []
         for anchor in anchors:
             if not bands or anchor.y - bands[-1][0].y > max(.012, (anchor.y1 - anchor.y0) * .6):
@@ -411,18 +729,27 @@ class LicenseTableExtractor:
                 left = right
         if headers:
             for i, (y, start, columns) in enumerate(headers):
+                if not is_citizen_list(columns):
+                    self.skipping = True
+                    continue
+                self.skipping = False
                 end = next((h[0] for h in headers[i + 1:] if h[0] - y > .015), 1.0)
                 rows = _read_rows(boxes, columns, start, end, grid, page_number)
                 if not rows:
                     continue
                 _finish_rows(rows, columns, grid)
-                if (self.tables and _continues(self.tables[-1], rows, page_number)
-                        and _compatible(self.previous_columns, columns)):
+                own = (self.tables and _continues(self.tables[-1], rows, page_number)
+                       and _compatible(self.previous_columns, columns))
+                repeated = self._read_repeated_header(boxes, columns, start, end, grid, page_number)
+                if repeated and (not own or _quality(repeated[1]) > _quality(rows)):
+                    columns, rows = repeated
+                    self.tables[-1]["rows"].extend(rows)
+                elif own:
                     self.tables[-1]["rows"].extend(rows)
                 else:
                     self.tables.append({"columns": columns, "rows": rows})
                 self.previous_columns = columns
-        elif self.tables:
+        elif self.tables and not self.skipping:
             # An unlabeled page needs matching row geometry and ordinal continuity.
             columns = _align_columns(self.previous_columns, grid)
             rows = _read_rows(boxes, columns, 0.0, 1.0, grid, page_number)
@@ -436,12 +763,52 @@ class LicenseTableExtractor:
                     previous.setdefault("unresolved_pages", []).append(page_number)
 
 
+def _quality(rows):
+    """Rows with a valid licence number and a confidently read person."""
+    return sum((r["license_state"] == "valid") + bool(r["identity_confident"]) for r in rows)
+
+
+def _same_layout(previous, current):
+    """The repeated heading of one list, even when OCR missed or misread a minor heading."""
+    if previous is None or abs(len(previous) - len(current)) > 2:
+        return False
+    for role in ("full_name", "birth_year", "license_number"):
+        mine = [c for c in previous if c["role"] == role]
+        theirs = [c for c in current if c["role"] == role]
+        if len(mine) != 1 or len(theirs) != 1:
+            return False
+        # A column next to a missed heading absorbs that space, so compare by containment.
+        (a,), (b,) = mine, theirs
+        if not (a["left"] <= (b["left"] + b["right"]) / 2 <= a["right"]
+                or b["left"] <= (a["left"] + a["right"]) / 2 <= b["right"]):
+            return False
+    return True
+
+
+def apply_cell_edit(table, row, column_index, value):
+    """Store a reviewed cell. The user's value is confirmed, so its OCR doubt is cleared."""
+    role = table["columns"][column_index]["role"]
+    row["cells"][column_index] = value
+    if column_index < len(row.get("scores", [])):
+        row["scores"][column_index] = 1.0
+    row["_edited"] = True
+    if role == "license_number" and [c["role"] for c in table["columns"]].count("license_number") == 1:
+        code = _license(value)
+        row["license_number"] = code
+        row["license_state"] = "valid" if code else ("blank" if not value else "uncertain")
+    elif role == "full_name":
+        row["identity_confident"] = bool(value)
+    elif role == "stt":
+        match = re.fullmatch(r"([0-9]{1,4})[.)]?", value)
+        row["stt"] = int(match[1]) if match else None
+
+
 def project_citizen(values, *, stt, page_number, license_number):
     """Keep the lookup representation consistent for OCR and Excel imports."""
     return {
         "stt": stt,
         "page_number": page_number,
-        "full_name": restore_vietnamese_name(values.get("full_name", "")),
+        "full_name": clean_vietnamese_name(values.get("full_name", "")),
         "birth_year": values.get("birth_year", ""),
         "address": normalize_vietnamese_address(values.get("address", "")),
         "nationality": normalize_nationality(values["nationality"]) if values.get("nationality") else "",

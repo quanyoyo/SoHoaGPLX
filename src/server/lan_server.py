@@ -56,7 +56,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-db_manager = DatabaseManager()
+# Opened on first use (server start or first request), not when this module is imported.
+db_manager: Optional[DatabaseManager] = None
+_db_lock = threading.Lock()
+
+
+def get_db() -> DatabaseManager:
+    global db_manager
+    with _db_lock:
+        if db_manager is None:
+            db_manager = DatabaseManager()
+        return db_manager
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 INDEX_HTML_PATH = get_resource_path(os.path.join("src", "server", "static", "index.html"))
@@ -74,7 +84,7 @@ async def serve_index():
 @app.get("/api/status")
 async def get_status():
     """Returns server status, LAN IP, and database statistics."""
-    stats = db_manager.get_stats()
+    stats = get_db().get_stats()
     ip = get_lan_ip()
     return {
         "status": "online",
@@ -91,7 +101,7 @@ async def get_provinces():
     code_to_name = {p["code"]: p["name"] for p in PROVINCE_CODES if "code" in p}
     provinces_list = []
     # Query distinct province codes from dossiers
-    with db_manager.get_connection() as conn:
+    with get_db().get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT province_code FROM dossiers ORDER BY province_code ASC")
         rows = cursor.fetchall()
@@ -113,26 +123,40 @@ async def search_citizens(
     province: str = Query("all", description="Mã tỉnh hoặc 'all'"),
     limit: int = Query(50, ge=1, le=200, description="Số lượng kết quả tối đa")
 ):
-    """Searches citizens using fast FTS5 SQLite index."""
+    """Searches citizens (substring match on the SQLite index)."""
     start_time = time.time()
-    results = db_manager.search(query=q, province_code=province, limit=limit)
+    db = get_db()
+    results = db.search(query=q, province_code=province, limit=limit)
+    total_matches = db.count_search(q, province_code=province)
+    # Files are fetched by dossier id; the server's own paths are not sent to clients.
+    results = [
+        {**{k: v for k, v in row.items() if k not in ("pdf_path", "excel_path")}, "has_excel": bool(row.get("excel_path"))}
+        for row in results
+    ]
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
     return {
         "query": q,
         "province": province,
         "total": len(results),
+        "total_matches": total_matches,
         "latency_ms": elapsed_ms,
         "results": results
     }
 
-@app.get("/api/pdf")
-async def stream_pdf(path: str = Query(..., description="Đường dẫn tuyệt đối hoặc tương đối tới file PDF")):
-    """
-    Streams PDF file safely over LAN for browser viewing with page jumping support.
-    """
-    if not os.path.isfile(path) or not path.lower().endswith(".pdf"):
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF hoặc định dạng không hợp lệ.")
-    
+def _dossier_file(dossier_id: int, kind: str) -> str:
+    """Only files of dossiers recorded in the database are served, never an arbitrary path."""
+    files = get_db().get_dossier_files(dossier_id)
+    path = files and files[f"{kind}_path"]
+    if not path or not os.path.isfile(path) or not path.lower().endswith(f".{'pdf' if kind == 'pdf' else 'xlsx'}"):
+        detail = "Không tìm thấy tệp PDF của hồ sơ." if kind == "pdf" else "Hồ sơ chưa có tệp Excel."
+        raise HTTPException(status_code=404, detail=detail)
+    return path
+
+
+@app.get("/api/pdf/{dossier_id}")
+async def stream_pdf(dossier_id: int):
+    """Streams a dossier's PDF for viewing in the browser (page jumps use #page=N)."""
+    path = _dossier_file(dossier_id, "pdf")
     return FileResponse(
         path,
         media_type="application/pdf",
@@ -141,14 +165,11 @@ async def stream_pdf(path: str = Query(..., description="Đường dẫn tuyệt
         headers={"Accept-Ranges": "bytes"},
     )
 
-@app.get("/api/excel")
-async def download_excel(path: str = Query(..., description="Đường dẫn tới file Excel tương ứng")):
-    """
-    Serves the companion Excel file for downloading by LAN client PCs.
-    """
-    if not os.path.isfile(path) or not path.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp Excel.")
-    
+
+@app.get("/api/excel/{dossier_id}")
+async def download_excel(dossier_id: int):
+    """Serves a dossier's companion Excel file for download."""
+    path = _dossier_file(dossier_id, "excel")
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -180,6 +201,9 @@ async def get_qr_code(url: Optional[str] = None):
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
+START_TIMEOUT_SECONDS = 10
+
+
 class LANServerManager:
     """
     Manages the lifecycle of the LAN FastAPI server in a background thread.
@@ -197,10 +221,13 @@ class LANServerManager:
         if self.is_running:
             return self.get_url()
 
-        if port:
+        if port is not None:
+            if not 1 <= port <= 65535:
+                raise ValueError(f"Cổng {port} không hợp lệ. Cổng phải là số từ 1 đến 65535 (mặc định 8080).")
             self.port = port
 
         logger.info("Starting LAN server on %s:%s", self.host, self.port)
+        get_db()
         app.state.port = self.port
         app.state.host = self.host
 
@@ -214,14 +241,23 @@ class LANServerManager:
             # Uvicorn's default formatter calls sys.stdout.isatty().
             log_config=None,
         )
-        self.server = uvicorn.Server(config)
-        self.thread = threading.Thread(target=self.server.run, daemon=True)
-        self.thread.start()
-        self.is_running = True
-
-        # Give it a brief moment to bind socket
-        time.sleep(0.5)
-        logger.info("LAN server thread started; access URL: %s", self.get_url())
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        # Report running only once the port is open: a busy port ends the thread instead.
+        deadline = time.monotonic() + START_TIMEOUT_SECONDS
+        while not server.started and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not server.started:
+            server.should_exit = True
+            thread.join(timeout=2.0)
+            logger.error("LAN server could not open port %s", self.port)
+            raise RuntimeError(
+                f"Không mở được cổng {self.port}. Cổng này có thể đang được chương trình khác "
+                "(hoặc một cửa sổ phần mềm khác) dùng. Hãy chọn cổng khác rồi bật lại."
+            )
+        self.server, self.thread, self.is_running = server, thread, True
+        logger.info("LAN server started; access URL: %s", self.get_url())
         return self.get_url()
 
     def stop(self):

@@ -76,9 +76,9 @@ def _generate_legacy_companion(
 
     # 2. Metadata info rows
     p_name = dossier_meta.get("province_name", "Yên Bái")
-    p_code = dossier_meta.get("province_code", "15")
-    hang = dossier_meta.get("license_class", "A1")
-    khoa = dossier_meta.get("course", "25")
+    p_code = dossier_meta.get("province_code", "")
+    hang = dossier_meta.get("license_class", "")
+    khoa = dossier_meta.get("course", "")
     ngay_thi = dossier_meta.get("exam_date", "")
     dia_diem = dossier_meta.get("exam_location", "")
     so_dau = dossier_meta.get("first_license_no", "")

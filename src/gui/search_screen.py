@@ -9,21 +9,46 @@ Includes 1-click jump to PDF page, open companion Excel, and open Windows Explor
 import os
 import subprocess
 import customtkinter as ctk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
 from typing import List, Dict, Any, Optional, Callable
 
 from src.database import DatabaseManager
 from src.config import PROVINCE_CODES, get_default_dulieu_dir
 from src.gui.pdf_viewer import PDFViewerFrame
+from src.logger import get_logger
+
+from src.gui.table_style import style_table
+
+logger = get_logger(__name__)
+SYNC_BUTTON_TEXT = "🔄 Quét lại từ Excel"
+RESULT_LIMIT = 200
+CITIZEN_COLUMNS = [
+    ("stt", "STT", 50), ("full_name", "Họ và tên", 190), ("birth_year", "Năm sinh", 80),
+    ("license_number", "Số bằng", 110), ("address", "Nơi cư trú", 240), ("box", "HỘP", 60),
+    ("box_number", "HỘP SỐ", 70), ("page", "Trang", 60), ("final_filename", "Hồ sơ", 240),
+]
+STRETCH_COLUMNS = ("full_name", "address", "final_filename")  # take the room left on wide windows
+DOSSIER_COLUMNS = [
+    ("idx", "STT", 50), ("province_code", "Tỉnh", 55), ("box", "HỘP", 60), ("box_number", "H.SỐ", 60),
+    ("final_filename", "Tên File PDF / Excel", 260), ("license_class", "Hạng", 60), ("exam_date", "Ngày bìa", 90),
+    ("total", "Số GPLX", 80), ("license_sequence", "Dãy số GPLX", 220), ("status_note", "Đánh giá", 130),
+]
 
 class SearchScreenFrame(ctk.CTkFrame):
-    def __init__(self, master, on_open_pdf_callback: Optional[Callable] = None, **kwargs):
+    def __init__(self, master, on_open_pdf_callback: Optional[Callable] = None, *,
+                 dispatch_to_ui: Optional[Callable] = None, run_in_background: Optional[Callable] = None, **kwargs):
         super().__init__(master, **kwargs)
         
         self.on_open_pdf_callback = on_open_pdf_callback
+        # Long folder scans run off the UI thread; without hooks (scripts) they run in place.
+        self.dispatch_to_ui = dispatch_to_ui or (lambda callback, *args, **kw: callback(*args, **kw))
+        self.run_in_background = run_in_background or (lambda job: job())
         self.db = DatabaseManager()
         self.current_citizen_results: List[Dict[str, Any]] = []
         self.current_dossier_results: List[Dict[str, Any]] = []
+        self.current_citizen_total = 0
+        self.current_dossier_total = 0
+        self._last_search = None  # (query, province, book id, book name) of the citizens listed
         self.current_mode = "👤 Tra Cứu Công Dân"
 
         self._build_ui()
@@ -89,7 +114,7 @@ class SearchScreenFrame(ctk.CTkFrame):
 
         self.btn_sync = ctk.CTkButton(
             self.citizen_search_frame,
-            text="🔄 Quét lại từ Excel",
+            text=SYNC_BUTTON_TEXT,
             font=("Segoe UI", 11),
             fg_color=("gray75", "gray30"),
             width=135,
@@ -161,9 +186,61 @@ class SearchScreenFrame(ctk.CTkFrame):
         )
         self.lbl_result_count.pack(side="right")
 
-        # 3. Scrollable Table
-        self.results_scroll = ctk.CTkScrollableFrame(self, fg_color=("gray95", "gray12"), corner_radius=6)
-        self.results_scroll.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+        # 3. Results: one table for any number of rows. Building a row of widgets per result used
+        # ~40 Windows handles each (10,000 per program), froze the window for seconds and could crash it.
+        self.results_frame = ctk.CTkFrame(self, fg_color=("gray95", "gray12"), corner_radius=6)
+        self.results_frame.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+
+        self.action_bar = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        self.action_bar.pack(fill="x", padx=8, pady=(6, 2))
+        self.lbl_selection = ctk.CTkLabel(self.action_bar, text="", font=("Segoe UI", 11, "bold"), anchor="w")
+        self.lbl_selection.pack(side="left", fill="x", expand=True)
+        self.btn_open_folder = ctk.CTkButton(
+            self.action_bar, text="📂 Thư mục", width=90, height=28, font=("Segoe UI", 11),
+            fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
+            command=lambda: self._run_on_selection(lambda row: self._open_containing_folder(row.get("pdf_path", ""))))
+        self.btn_open_folder.pack(side="right", padx=2)
+        self.btn_open_excel = ctk.CTkButton(
+            self.action_bar, text="📊 Excel", width=80, height=28, font=("Segoe UI", 11),
+            fg_color="#16A34A", hover_color="#15803D",
+            command=lambda: self._run_on_selection(lambda row: self._open_external_file(row.get("excel_path", ""))))
+        self.btn_open_excel.pack(side="right", padx=2)
+        self.btn_view_pdf = ctk.CTkButton(
+            self.action_bar, text="👁️ Xem PDF", width=110, height=28, font=("Segoe UI", 11, "bold"),
+            fg_color="#0066CC", hover_color="#004C99",
+            command=lambda: self._run_on_selection(self._view_selected_pdf))
+        self.btn_view_pdf.pack(side="right", padx=2)
+        self.btn_view_citizens = ctk.CTkButton(
+            self.action_bar, text="👥 Xem Dân", width=95, height=28, font=("Segoe UI", 11, "bold"),
+            fg_color="#2563EB", hover_color="#1D4ED8",
+            command=lambda: self._run_on_selection(
+                lambda row: self.drill_down_to_dossier_citizens(row.get("id"), row.get("final_filename", ""))))
+
+        self.table_holder = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        self.results_tree = ttk.Treeview(self.table_holder, show="headings", style="GPLXSearch.Treeview",
+                                         selectmode="browse")
+        self._columns = []
+        self._apply_table_scaling()
+        y_scroll = ctk.CTkScrollbar(self.table_holder, orientation="vertical", command=self.results_tree.yview)
+        x_scroll = ctk.CTkScrollbar(self.table_holder, orientation="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.table_holder.grid_rowconfigure(0, weight=1)
+        self.table_holder.grid_columnconfigure(0, weight=1)
+        self.results_tree.tag_configure("odd", background="#F8FAFC")
+        self.results_tree.tag_configure("complete", foreground="#16A34A")
+        self.results_tree.tag_configure("attention", foreground="#C2410C")
+        self.results_tree.bind("<<TreeviewSelect>>", lambda e: self._update_action_bar())
+        self.results_tree.bind("<Double-1>", self._on_result_double_click)
+        # Enter opens the selected row wherever the mouse is (a key carries the pointer position too).
+        self.results_tree.bind("<Return>", self._on_result_enter)
+        self.results_tree.bind("<KP_Enter>", self._on_result_enter)
+        self.lbl_placeholder = ctk.CTkLabel(self.results_frame, text="", font=("Segoe UI", 12, "italic"),
+                                            text_color="gray50")
+        self._rows: List[Dict[str, Any]] = []
+        self._rows_kind = "citizen"
 
         self._render_empty_placeholder("Nhập từ khóa và nhấn 'Tìm Kiếm' để tra cứu hồ sơ người lái xe.")
 
@@ -174,7 +251,7 @@ class SearchScreenFrame(ctk.CTkFrame):
             self.citizen_search_frame.pack(fill="x", padx=14, pady=(4, 8))
             self.refresh_stats()
             if self.current_citizen_results:
-                self._render_citizen_results(self.current_citizen_results)
+                self._render_citizen_results(self.current_citizen_results, self.current_citizen_total)
             else:
                 self._render_empty_placeholder("Nhập từ khóa và nhấn 'Tìm Kiếm' để tra cứu hồ sơ người lái xe.")
         else:
@@ -216,119 +293,91 @@ class SearchScreenFrame(ctk.CTkFrame):
     # MODE 1: CITIZEN SEARCH
     # ==========================================
 
-    def perform_citizen_search(self, dossier_id: Optional[int] = None):
-        q = self.txt_query.get().strip()
+    def perform_citizen_search(self, dossier_id: Optional[int] = None, dossier_name: str = ""):
+        q = "" if dossier_id else self.txt_query.get().strip()
         if not q and not dossier_id:
+            self._last_search = None
             self._render_empty_placeholder("Vui lòng nhập từ khóa tìm kiếm (Số bằng, Họ tên, hoặc Năm sinh).")
             return
 
         prov_sel = self.cmb_prov_filter.get().strip()
         prov_code = None
-        if prov_sel and "-" in prov_sel:
+        # A book is shown whole: the province box only narrows keyword searches (with another
+        # province chosen, "Xem Dân" used to show an empty list).
+        if not dossier_id and prov_sel and "-" in prov_sel:
             prov_code = prov_sel.split("-")[0].strip()
+        self._last_search = (q, prov_code, dossier_id, dossier_name)
+        self._run_citizen_search(q, prov_code, dossier_id, dossier_name)
 
+    def _run_citizen_search(self, q, prov_code, dossier_id=None, dossier_name="", quiet=False):
         try:
-            results = self.db.search(query=q, province_code=prov_code, dossier_id=dossier_id, limit=200)
-            self.current_citizen_results = results
-            self._render_citizen_results(results)
+            results = self.db.search(query=q, province_code=prov_code, dossier_id=dossier_id, limit=RESULT_LIMIT)
+            total = len(results) if dossier_id else self.db.count_search(q, province_code=prov_code)
+            empty_book = self._empty_book_message(dossier_id, dossier_name) if dossier_id and not results else ""
         except Exception as e:
-            messagebox.showerror("Lỗi Tra Cứu", f"Không thể tra cứu CSDL:\n{e}")
+            if quiet:
+                logger.warning("Could not refresh the search results: %s", e)
+            else:
+                messagebox.showerror("Lỗi Tra Cứu", f"Không thể tra cứu CSDL:\n{e}")
+            return
+        self.current_citizen_results = results
+        self.current_citizen_total = total
+        if empty_book:
+            self._render_empty_placeholder(empty_book)
+            return
+        self._render_citizen_results(results, total)
 
-    def _render_citizen_results(self, results: List[Dict[str, Any]]):
-        for w in self.results_scroll.winfo_children():
-            w.destroy()
+    def _empty_book_message(self, dossier_id, name):
+        files = self.db.get_dossier_files(dossier_id)
+        if files is None:
+            return f"Cuốn sổ {name} không còn trong CSDL (PDF đã đổi tên hoặc bị xóa). Hãy lọc lại danh mục."
+        if not files["excel_path"]:
+            return (f"Hồ sơ {name} mới được đổi tên nhanh, chưa số hóa danh sách GPLX "
+                    "nên chưa có danh sách công dân để xem.")
+        return f"Cuốn sổ {name} chưa có công dân nào trong CSDL."
 
-        count = len(results)
-        self.lbl_result_count.configure(text=f"Tìm thấy {count} kết quả công dân")
+    def refresh_results(self):
+        """Show the listed rows again from the database (after a re-scan or a save), without error popups."""
+        if self.current_mode != "👤 Tra Cứu Công Dân":
+            self.perform_dossier_search(quiet=True)
+            return
+        if self._last_search is None:
+            return
+        q, prov_code, dossier_id, name = self._last_search
+        if dossier_id and name:
+            # A re-scan or a new save records the book again under a new id: find it by name.
+            try:
+                dossier_id = self.db.get_dossier_id(name)
+            except Exception as exc:
+                logger.warning("Could not refresh the book %s: %s", name, exc)
+                return
+            if dossier_id is None:
+                self._render_empty_placeholder(f"Cuốn sổ {name} không còn trong CSDL (PDF đã đổi tên hoặc bị xóa).")
+                return
+            self._last_search = (q, prov_code, dossier_id, name)
+        self._run_citizen_search(q, prov_code, dossier_id, name, quiet=True)
 
-        if count == 0:
+    def _render_citizen_results(self, results: List[Dict[str, Any]], total: Optional[int] = None):
+        total = len(results) if total is None else total
+        if not results:
             self._render_empty_placeholder("Không tìm thấy người dân nào khớp với từ khóa tìm kiếm.")
             return
-
-        # Table Header
-        headers = [
-            ("STT", 40),
-            ("Họ và tên", 160),
-            ("Năm sinh", 75),
-            ("Số bằng", 100),
-            ("Nơi cư trú", 170),
-            ("HỘP", 50),
-            ("HỘP SỐ", 65),
-            ("Trang", 55),
-            ("Thao tác", 280)
-        ]
-
-        header_frame = ctk.CTkFrame(self.results_scroll, fg_color=("#1F497D", "#1F497D"), corner_radius=3)
-        header_frame.pack(fill="x", pady=(2, 4))
-
-        for col_name, width in headers:
-            lbl = ctk.CTkLabel(header_frame, text=col_name, width=width, font=("Segoe UI", 11, "bold"), text_color="white")
-            lbl.pack(side="left", padx=3, pady=4)
-
-        # Rows
-        for idx, row in enumerate(results):
-            row_bg = ("white", "#262626") if idx % 2 == 0 else ("#F8FAFC", "#1E1E1E")
-            r_frame = ctk.CTkFrame(self.results_scroll, fg_color=row_bg, corner_radius=3)
-            r_frame.pack(fill="x", pady=1)
-
-            ctk.CTkLabel(r_frame, text=str(row.get("stt", idx + 1)), width=40, font=("Segoe UI", 11)).pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=row.get("full_name", ""), width=160, font=("Segoe UI", 11, "bold"), anchor="w").pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=str(row.get("birth_year", "")), width=75, font=("Segoe UI", 11)).pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=row.get("license_number", ""), width=100, font=("Segoe UI", 11, "bold"), text_color="#0066CC").pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=row.get("address", ""), width=170, font=("Segoe UI", 11), anchor="w").pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=str(row.get("box", "")), width=50, font=("Segoe UI", 11)).pack(side="left", padx=3)
-            ctk.CTkLabel(r_frame, text=str(row.get("box_number", "")), width=65, font=("Segoe UI", 11)).pack(side="left", padx=3)
-
-            p_num = row.get("page_number", 1)
-            ctk.CTkLabel(r_frame, text=f"Trang {p_num}", width=55, font=("Segoe UI", 11)).pack(side="left", padx=3)
-
-            actions_frame = ctk.CTkFrame(r_frame, fg_color="transparent", width=280)
-            actions_frame.pack(side="left", padx=3)
-
-            pdf_p = row.get("pdf_path", "")
-            xls_p = row.get("excel_path", "")
-
-            btn_view_pdf = ctk.CTkButton(
-                actions_frame,
-                text=f"👁️ Xem PDF (P.{p_num})",
-                font=("Segoe UI", 10, "bold"),
-                width=105,
-                height=24,
-                fg_color="#0066CC",
-                hover_color="#004C99",
-                command=lambda p=pdf_p, pg=p_num: self._open_pdf_viewer(p, pg)
-            )
-            btn_view_pdf.pack(side="left", padx=2)
-
-            btn_open_excel = ctk.CTkButton(
-                actions_frame,
-                text="📊 Excel",
-                font=("Segoe UI", 10),
-                width=65,
-                height=24,
-                fg_color="#1E7E34",
-                hover_color="#155724",
-                command=lambda xp=xls_p: self._open_external_file(xp)
-            )
-            btn_open_excel.pack(side="left", padx=2)
-
-            btn_open_folder = ctk.CTkButton(
-                actions_frame,
-                text="📂 Thư mục",
-                font=("Segoe UI", 10),
-                width=75,
-                height=24,
-                fg_color=("gray70", "gray35"),
-                hover_color=("gray60", "gray45"),
-                command=lambda fp=pdf_p: self._open_containing_folder(fp)
-            )
-            btn_open_folder.pack(side="left", padx=2)
+        if total > len(results):
+            text = f"Hiện {len(results)}/{total} kết quả đầu — hãy gõ cụ thể hơn (họ tên đầy đủ, số bằng, năm sinh)"
+        else:
+            text = f"Tìm thấy {total} kết quả công dân"
+        self._show_rows("citizen", CITIZEN_COLUMNS, results, [
+            (row.get("stt", ""), row.get("full_name", ""), row.get("birth_year", ""), row.get("license_number", ""),
+             row.get("address", ""), row.get("box", ""), row.get("box_number", ""), row.get("page_number", 1),
+             row.get("final_filename", ""))
+            for row in results
+        ], text, [None] * len(results))
 
     # ==========================================
     # MODE 2: DOSSIER & EXCEL INVENTORY
     # ==========================================
 
-    def perform_dossier_search(self):
+    def perform_dossier_search(self, quiet=False):
         prov_sel = self.cmb_dossier_prov.get().strip()
         prov_code = "all"
         if prov_sel and "-" in prov_sel:
@@ -342,151 +391,152 @@ class SearchScreenFrame(ctk.CTkFrame):
         kw = self.txt_dossier_kw.get().strip()
 
         try:
-            dossiers = self.db.get_all_dossiers(province_code=prov_code, box=box_val, search_kw=kw, limit=200)
-            self.current_dossier_results = dossiers
-            self._render_dossier_results(dossiers)
-            self.refresh_stats()
+            dossiers = self.db.get_all_dossiers(province_code=prov_code, box=box_val, search_kw=kw, limit=RESULT_LIMIT)
+            total = self.db.count_dossiers(province_code=prov_code, box=box_val, search_kw=kw)
         except Exception as e:
-            messagebox.showerror("Lỗi Truy Vấn", f"Không thể lấy danh sách cuốn sổ đã nạp:\n{e}")
+            if quiet:
+                logger.warning("Could not refresh the book list: %s", e)
+            else:
+                messagebox.showerror("Lỗi Truy Vấn", f"Không thể lấy danh sách cuốn sổ đã nạp:\n{e}")
+            return
+        self.current_dossier_results = dossiers
+        self.current_dossier_total = total
+        self._render_dossier_results(dossiers, total)
+        self.refresh_stats()
 
-    def _render_dossier_results(self, dossiers: List[Dict[str, Any]]):
-        for w in self.results_scroll.winfo_children():
-            w.destroy()
-
-        count = len(dossiers)
-        self.lbl_result_count.configure(text=f"Có {count} cuốn sổ / file Excel trong CSDL")
-
-        if count == 0:
+    def _render_dossier_results(self, dossiers: List[Dict[str, Any]], total: Optional[int] = None):
+        total = len(dossiers) if total is None else total
+        if not dossiers:
             self._render_empty_placeholder("Chưa có cuốn sổ hoặc file Excel nào được import vào hệ thống phù hợp với bộ lọc.")
             return
-
-        # Dossier Table Headers
-        headers = [
-            ("STT", 35),
-            ("Tỉnh", 55),
-            ("HỘP", 50),
-            ("H.SỐ", 60),
-            ("Tên File PDF / Excel", 240),
-            ("Hạng", 50),
-            ("Ngày bìa", 85),
-            ("Số GPLX", 65),
-            ("Dãy số GPLX", 170),
-            ("Đánh giá", 95),
-            ("Thao tác", 270)
-        ]
-
-        header_frame = ctk.CTkFrame(self.results_scroll, fg_color=("#0F766E", "#0F766E"), corner_radius=3)
-        header_frame.pack(fill="x", pady=(2, 4))
-
-        for col_name, width in headers:
-            lbl = ctk.CTkLabel(header_frame, text=col_name, width=width, font=("Segoe UI", 11, "bold"), text_color="white")
-            lbl.pack(side="left", padx=2, pady=4)
-
-        # Rows
+        if total > len(dossiers):
+            text = f"Hiện {len(dossiers)}/{total} cuốn sổ mới nhất — lọc theo tỉnh, hộp hoặc tên file để thu hẹp"
+        else:
+            text = f"Có {total} cuốn sổ / file Excel trong CSDL"
+        values, tags = [], []
         for idx, d in enumerate(dossiers, start=1):
-            row_bg = ("white", "#262626") if idx % 2 == 1 else ("#F0FDFA", "#1A2E2B")
-            r_frame = ctk.CTkFrame(self.results_scroll, fg_color=row_bg, corner_radius=3)
-            r_frame.pack(fill="x", pady=1)
-
-            ctk.CTkLabel(r_frame, text=str(idx), width=35, font=("Segoe UI", 11)).pack(side="left", padx=2)
-            ctk.CTkLabel(r_frame, text=str(d.get("province_code", "")), width=55, font=("Segoe UI", 11, "bold"), text_color="#0D9488").pack(side="left", padx=2)
-            ctk.CTkLabel(r_frame, text=str(d.get("box", "-")), width=50, font=("Segoe UI", 11)).pack(side="left", padx=2)
-            ctk.CTkLabel(r_frame, text=str(d.get("box_number", "-")), width=60, font=("Segoe UI", 11)).pack(side="left", padx=2)
-
-            fname = d.get("final_filename", "")
-            ctk.CTkLabel(r_frame, text=fname, width=240, font=("Consolas", 10.5, "bold"), anchor="w").pack(side="left", padx=2)
-
-            lic_cls = d.get("license_class") or "A1"
-            ctk.CTkLabel(r_frame, text=lic_cls, width=50, font=("Segoe UI", 11)).pack(side="left", padx=2)
-
-            ex_date = d.get("exam_date") or "-"
-            ctk.CTkLabel(r_frame, text=ex_date, width=85, font=("Segoe UI", 11)).pack(side="left", padx=2)
-
-            total_c = d.get("total_citizens", 0)
-            ctk.CTkLabel(r_frame, text=f"{total_c} bằng", width=65, font=("Segoe UI", 11, "bold"), text_color="#2563EB").pack(side="left", padx=2)
-
-            seq = d.get("license_sequence") or "-"
-            ctk.CTkLabel(r_frame, text=seq, width=170, font=("Segoe UI", 10), anchor="w").pack(side="left", padx=2)
-
-            note = d.get("status_note") or "Đủ"
-            note_color = "#16A34A" if "Đủ" in note else "#EA580C"
-            ctk.CTkLabel(r_frame, text=note, width=95, font=("Segoe UI", 10.5, "bold"), text_color=note_color).pack(side="left", padx=2)
-
-            # Actions: [👥 Xem Dân] [👁️ PDF] [📊 Excel]
-            actions_frame = ctk.CTkFrame(r_frame, fg_color="transparent", width=270)
-            actions_frame.pack(side="left", padx=2)
-
-            d_id = d.get("id")
-            pdf_p = d.get("pdf_path", "")
-            xls_p = d.get("excel_path", "")
-
-            btn_drill_down = ctk.CTkButton(
-                actions_frame,
-                text="👥 Xem Dân",
-                font=("Segoe UI", 10, "bold"),
-                width=80,
-                height=24,
-                fg_color="#2563EB",
-                hover_color="#1D4ED8",
-                command=lambda did=d_id, fn=fname: self.drill_down_to_dossier_citizens(did, fn)
-            )
-            btn_drill_down.pack(side="left", padx=2)
-
-            btn_pdf = ctk.CTkButton(
-                actions_frame,
-                text="👁️ PDF",
-                font=("Segoe UI", 10),
-                width=60,
-                height=24,
-                fg_color="#0066CC",
-                hover_color="#004C99",
-                command=lambda p=pdf_p: self._open_pdf_viewer(p, 1)
-            )
-            btn_pdf.pack(side="left", padx=2)
-
-            btn_excel = ctk.CTkButton(
-                actions_frame,
-                text="📊 Excel",
-                font=("Segoe UI", 10),
-                width=60,
-                height=24,
-                fg_color="#16A34A",
-                hover_color="#15803D",
-                command=lambda xp=xls_p: self._open_external_file(xp)
-            )
-            btn_excel.pack(side="left", padx=2)
-
-            btn_folder = ctk.CTkButton(
-                actions_frame,
-                text="📂",
-                font=("Segoe UI", 10),
-                width=32,
-                height=24,
-                fg_color=("gray70", "gray35"),
-                hover_color=("gray60", "gray45"),
-                command=lambda fp=pdf_p: self._open_containing_folder(fp)
-            )
-            btn_folder.pack(side="left", padx=2)
+            note = d.get("status_note") or ""
+            values.append((idx, d.get("province_code", ""), d.get("box") or "-", d.get("box_number") or "-",
+                           d.get("final_filename", ""), d.get("license_class") or "-", d.get("exam_date") or "-",
+                           f"{d.get('total_citizens') or 0} bằng", d.get("license_sequence") or "-", note or "-"))
+            tags.append("complete" if note.startswith("Đủ") else "attention" if note else None)
+        self._show_rows("dossier", DOSSIER_COLUMNS, dossiers, values, text, tags)
 
     def drill_down_to_dossier_citizens(self, dossier_id: int, dossier_name: str):
         """Switches view to Citizen Mode and displays all citizens belonging to this dossier."""
         self.mode_toggle.set("👤 Tra Cứu Công Dân")
-        self.on_mode_change("👤 Tra Cứu Công Dân")
+        self.current_mode = "👤 Tra Cứu Công Dân"
+        self.dossier_search_frame.pack_forget()
+        self.citizen_search_frame.pack(fill="x", padx=14, pady=(4, 8))
         self.txt_query.delete(0, "end")
-        self.txt_query.insert(0, f"")
         self.lbl_stats.configure(text=f"📂 Đang hiển thị danh sách công dân trong cuốn sổ: {dossier_name}")
-        self.perform_citizen_search(dossier_id=dossier_id)
+        self.perform_citizen_search(dossier_id=dossier_id, dossier_name=dossier_name)
 
     # ==========================================
     # COMMON UTILITIES
     # ==========================================
 
+    def _apply_table_scaling(self):
+        """Size the table like the rest of the window (see table_style)."""
+        scale = self._get_widget_scaling()
+        style_table(self, "GPLXSearch.Treeview", scale)
+        for key, _, width in self._columns:
+            # Wide columns only grow: on a narrow window the table scrolls instead of squeezing names.
+            smallest = width if key in STRETCH_COLUMNS else 40
+            self.results_tree.column(key, width=round(width * scale), minwidth=round(smallest * scale))
+
+    def _set_scaling(self, new_widget_scaling, new_window_scaling):
+        # Called by CustomTkinter when the window moves to a screen with another display scale.
+        super()._set_scaling(new_widget_scaling, new_window_scaling)
+        if hasattr(self, "results_tree"):
+            self._apply_table_scaling()
+
+    def _show_rows(self, kind, columns, rows, values, count_text, tags):
+        tree = self.results_tree
+        tree.delete(*tree.get_children())
+        tree["columns"] = [key for key, _, _ in columns]
+        for key, label, _ in columns:
+            tree.heading(key, text=label)
+            tree.column(key, stretch=key in STRETCH_COLUMNS,
+                        anchor="w" if key in ("full_name", "address", "final_filename", "license_sequence") else "center")
+        self._columns = columns
+        self._apply_table_scaling()
+        for index, (row_values, tag) in enumerate(zip(values, tags)):
+            row_tags = tuple(t for t in (tag, "odd" if index % 2 else None) if t)
+            tree.insert("", "end", iid=str(index), values=["" if v is None else str(v) for v in row_values],
+                        tags=row_tags)
+        self._rows, self._rows_kind = rows, kind
+        self.lbl_result_count.configure(text=count_text)
+        self.lbl_placeholder.pack_forget()
+        self.action_bar.pack(fill="x", padx=8, pady=(6, 2))
+        self.table_holder.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        if kind == "dossier":
+            self.btn_view_citizens.pack(side="right", padx=2, before=self.btn_view_pdf)
+        else:
+            self.btn_view_citizens.pack_forget()
+        tree.yview_moveto(0)
+        first = tree.get_children()[:1]
+        if first:
+            tree.selection_set(first)
+            tree.focus(first[0])
+        self._update_action_bar()
+
+    def _selected_row(self) -> Optional[Dict[str, Any]]:
+        selection = self.results_tree.selection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        return self._rows[index] if index < len(self._rows) else None
+
+    def _run_on_selection(self, action):
+        row = self._selected_row()
+        if row is not None:
+            action(row)
+
+    def _update_action_bar(self):
+        row = self._selected_row()
+        state = "normal" if row else "disabled"
+        for button in (self.btn_view_pdf, self.btn_open_excel, self.btn_open_folder, self.btn_view_citizens):
+            button.configure(state=state)
+        if row is None:
+            self.lbl_selection.configure(text="")
+        elif self._rows_kind == "citizen":
+            self.btn_view_pdf.configure(text=f"👁️ Xem PDF (trang {row.get('page_number', 1)})")
+            self.lbl_selection.configure(text=f"{row.get('full_name', '')} — {row.get('final_filename', '')}")
+        else:
+            self.btn_view_pdf.configure(text="👁️ Xem PDF")
+            self.lbl_selection.configure(text=row.get("final_filename", ""))
+
+    def _view_selected_pdf(self, row):
+        page = row.get("page_number", 1) if self._rows_kind == "citizen" else 1
+        self._open_pdf_viewer(row.get("pdf_path", ""), page)
+
+    def _on_result_double_click(self, event):
+        if self.results_tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+            return  # double-click on a heading or column separator
+        self._open_selected_row()
+
+    def _on_result_enter(self, _event=None):
+        self._open_selected_row()
+
+    def _open_selected_row(self):
+        """Double-click or Enter: a book shows its citizens, a citizen opens the PDF page."""
+        row = self._selected_row()
+        if row is None:
+            return
+        if self._rows_kind == "dossier":
+            self.drill_down_to_dossier_citizens(row.get("id"), row.get("final_filename", ""))
+        else:
+            self._view_selected_pdf(row)
+
     def _render_empty_placeholder(self, text: str):
-        for w in self.results_scroll.winfo_children():
-            w.destroy()
+        self.results_tree.delete(*self.results_tree.get_children())
+        self._rows = []
         self.lbl_result_count.configure(text="")
-        lbl = ctk.CTkLabel(self.results_scroll, text=text, font=("Segoe UI", 12, "italic"), text_color="gray50")
-        lbl.pack(pady=40)
+        self.action_bar.pack_forget()
+        self.table_holder.pack_forget()
+        self.lbl_placeholder.configure(text=text)
+        self.lbl_placeholder.pack(pady=40)
 
     def _open_pdf_viewer(self, pdf_path: str, page_num: int):
         if not os.path.exists(pdf_path):
@@ -509,6 +559,9 @@ class SearchScreenFrame(ctk.CTkFrame):
         viewer.load_pdf(pdf_path, initial_page=page_num)
 
     def _open_external_file(self, file_path: str):
+        if not file_path:
+            messagebox.showinfo("Chưa có Excel", "Hồ sơ này mới được đổi tên nhanh, chưa số hóa nên chưa có file Excel.")
+            return
         if not os.path.exists(file_path):
             messagebox.showwarning("Không tìm thấy tệp", f"Tệp Excel không tồn tại:\n{file_path}")
             return
@@ -528,20 +581,42 @@ class SearchScreenFrame(ctk.CTkFrame):
 
     def _sync_from_excel_folder(self):
         folder = filedialog.askdirectory(
-            title="Chọn thư mục chứa các tệp Excel để đồng bộ vào CSDL",
+            title="Chọn thư mục kho dữ liệu (Excel và sổ tổng hợp tỉnh) để đồng bộ vào CSDL",
             initialdir=get_default_dulieu_dir()
         )
         if not folder:
             return
+        self.btn_sync.configure(state="disabled", text="⏳ Đang đồng bộ…")
+
+        def job():
+            errors, removed = [], []
+            try:
+                count = self.db.reindex_from_directory(folder, errors=errors, removed=removed)
+            except Exception as exc:
+                logger.exception("Could not sync from %s", folder)
+                self.dispatch_to_ui(self._finish_sync, 0, errors, str(exc))
+            else:
+                self.dispatch_to_ui(self._finish_sync, count, errors, None, removed)
 
         try:
-            errors = []
-            count = self.db.reindex_from_directory(folder, errors=errors)
-            self.refresh_stats()
-            if errors:
-                details = "\n".join(f"• {name}: {error}" for name, error in errors[:4])
-                messagebox.showwarning("Kết quả đồng bộ", f"Đã đồng bộ {count} cuốn sổ. Có {len(errors)} file gặp lỗi.\n\n{details}")
-            else:
-                messagebox.showinfo("Đồng bộ thành công", f"Đã đồng bộ {count} cuốn sổ vào CSDL.")
-        except Exception as e:
-            messagebox.showerror("Lỗi đồng bộ", f"Có lỗi xảy ra khi quét thư mục:\n{e}")
+            self.run_in_background(job)
+        except Exception:
+            self.btn_sync.configure(state="normal", text=SYNC_BUTTON_TEXT)
+            raise
+
+    def _finish_sync(self, count, errors, failure, removed=()):
+        self.btn_sync.configure(state="normal", text=SYNC_BUTTON_TEXT)
+        if failure:
+            messagebox.showerror("Lỗi đồng bộ", f"Có lỗi xảy ra khi quét thư mục:\n{failure}")
+            return
+        self.refresh_stats()
+        self.refresh_results()  # dossiers just dropped were still listed and led to missing files
+        dropped = ""
+        if removed:
+            names = ", ".join(removed[:4]) + (", …" if len(removed) > 4 else "")
+            dropped = f"\n\nĐã bỏ {len(removed)} hồ sơ không còn PDF trong thư mục (đã đổi tên hoặc xóa): {names}"
+        if errors:
+            details = "\n".join(f"• {name}: {error}" for name, error in errors[:4])
+            messagebox.showwarning("Kết quả đồng bộ", f"Đã đồng bộ {count} hồ sơ. Có {len(errors)} mục gặp lỗi.\n\n{details}{dropped}")
+        else:
+            messagebox.showinfo("Đồng bộ thành công", f"Đã đồng bộ {count} hồ sơ vào CSDL (gồm cả hồ sơ đổi tên nhanh trong sổ tổng hợp tỉnh).{dropped}")

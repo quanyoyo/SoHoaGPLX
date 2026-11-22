@@ -84,14 +84,13 @@ def run_test():
             
             first_row = search_res["results"][0]
             print(f"  -> Bản ghi đầu tiên: {first_row.get('full_name')} | GPLX: {first_row.get('license_number')} | Trang: {first_row.get('page_number')}")
-            sample_pdf_path = first_row.get("pdf_path")
-            sample_excel_path = first_row.get("excel_path")
+            sample_dossier_id = first_row.get("dossier_id")
+            sample_has_excel = first_row.get("has_excel")
 
         # 8. Test PDF Streaming (GET /api/pdf)
         print(f"\n[8] Kiểm tra truyền tải Stream File PDF qua mạng LAN (GET /api/pdf)...")
-        if sample_pdf_path and os.path.exists(sample_pdf_path):
-            encoded_pdf = urllib.parse.quote(sample_pdf_path)
-            with urllib.request.urlopen(f"{base_url}/api/pdf?path={encoded_pdf}") as resp:
+        if sample_dossier_id:
+            with urllib.request.urlopen(f"{base_url}/api/pdf/{sample_dossier_id}") as resp:
                 assert resp.status == 200
                 content_type = resp.headers.get("Content-Type", "")
                 assert "application/pdf" in content_type
@@ -103,9 +102,8 @@ def run_test():
 
         # 9. Test Excel File Download (GET /api/excel)
         print(f"\n[9] Kiểm tra tải File Excel đồng hành qua mạng LAN (GET /api/excel)...")
-        if sample_excel_path and os.path.exists(sample_excel_path):
-            encoded_xlsx = urllib.parse.quote(sample_excel_path)
-            with urllib.request.urlopen(f"{base_url}/api/excel?path={encoded_xlsx}") as resp:
+        if sample_dossier_id and sample_has_excel:
+            with urllib.request.urlopen(f"{base_url}/api/excel/{sample_dossier_id}") as resp:
                 assert resp.status == 200
                 content_type = resp.headers.get("Content-Type", "")
                 assert "spreadsheetml" in content_type or "octet-stream" in content_type

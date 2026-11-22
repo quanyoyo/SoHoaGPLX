@@ -1,51 +1,12 @@
 """
-Vietnamese Diacritics Restoration & Normalization Utility.
-Accurately restores accents for Vietnamese Names, Administrative Addresses, and Common Words.
+Normalization of Vietnamese lookup fields.
+
+Personal names keep the letters and accents that were read; known administrative place names
+in addresses get their accents from a fixed gazetteer.
 """
 import re
+import unicodedata
 from typing import Dict, List
-
-# Dictionary of Common Vietnamese Surnames (Họ)
-VIETNAMESE_SURNAMES: Dict[str, str] = {
-    "tran": "Trần", "nguyen": "Nguyễn", "le": "Lê", "pham": "Phạm",
-    "hoang": "Hoàng", "huynh": "Huỳnh", "phan": "Phan", "vu": "Vũ",
-    "vo": "Võ", "dang": "Đặng", "bui": "Bùi", "do": "Đỗ", "bo": "Đỗ",
-    "ho": "Hồ", "ngo": "Ngô", "duong": "Dương", "ly": "Lý",
-    "dao": "Đào", "doan": "Đoàn", "dinh": "Đinh", "lam": "Lâm",
-    "phung": "Phùng", "mai": "Mai", "trinh": "Trịnh", "luong": "Lương",
-    "luu": "Lưu", "ha": "Hà", "cao": "Cao", "thai": "Thái",
-    "ta": "Tạ", "tong": "Tống", "truong": "Trương", "quach": "Quách",
-    "chu": "Chu", "chau": "Châu", "nghiem": "Nghiêm", "tu": "Từ"
-}
-
-# Common Vietnamese Middle Names (Tên đệm)
-VIETNAMESE_MIDDLE_NAMES: Dict[str, str] = {
-    "van": "Văn", "thi": "Thị", "tien": "Tiến", "duc": "Đức",
-    "huu": "Hữu", "dinh": "Đình", "xuan": "Xuân", "vi": "Vi",
-    "ngoc": "Ngọc", "thanh": "Thanh", "quang": "Quang", "minh": "Minh",
-    "cong": "Công", "duy": "Duy", "anh": "Anh", "bao": "Bảo",
-    "hai": "Hải", "tuan": "Tuấn", "kim": "Kim", "hong": "Hồng",
-    "trong": "Trọng", "ba": "Bá", "phuoc": "Phước", "dai": "Đại",
-    "the": "Thế", "phu": "Phú", "chi": "Chí", "manh": "Mạnh"
-}
-
-# Common Vietnamese Given Names (Tên gọi)
-VIETNAMESE_GIVEN_NAMES: Dict[str, str] = {
-    "yen": "Yên", "thuy": "Thúy", "vinh": "Vinh", "thuong": "Thượng",
-    "thutdng": "Thượng", "thuong'": "Thượng", "hung": "Hùng", "dung": "Dũng",
-    "tuan": "Tuấn", "nam": "Nam", "binh": "Bình", "lan": "Lan",
-    "hoa": "Hoa", "mai": "Mai", "huong": "Hương", "linh": "Linh",
-    "phuong": "Phương", "cuong": "Cường", "thang": "Thắng", "hai": "Hải",
-    "hieu": "Hiếu", "dat": "Đạt", "huy": "Huy", "tung": "Tùng",
-    "long": "Long", "khoa": "Khoa", "trung": "Trung", "phuc": "Phúc",
-    "kien": "Kiên", "quan": "Quân", "son": "Sơn", "ha": "Hà",
-    "toan": "Toàn", "truong": "Trường", "giang": "Giang", "diep": "Diệp",
-    "thao": "Thảo", "trang": "Trang", "nga": "Nga", "hang": "Hằng",
-    "tuyet": "Tuyết", "nguyet": "Nguyệt", "quyen": "Quyên", "anh": "Anh",
-    "chien": "Chiến", "loi": "Lợi", "loc": "Lộc", "phat": "Phát",
-    "tai": "Tài", "nghia": "Nghĩa", "thuan": "Thuận", "khanh": "Khánh",
-    "phong": "Phong", "vuong": "Vương", "canh": "Cảnh", "thanh": "Thành"
-}
 
 # Administrative Gazetteer (Địa danh hành chính)
 ADMIN_LOCATIONS: Dict[str, str] = {
@@ -59,52 +20,19 @@ ADMIN_LOCATIONS: Dict[str, str] = {
     "viet nam": "Việt Nam", "iviet nam": "Việt Nam"
 }
 
-def restore_vietnamese_name(raw_name: str) -> str:
+def clean_vietnamese_name(raw_name: str) -> str:
+    """Tidy a personal name without changing its letters or accents.
+
+    Accents are never guessed: 'Thanh' may be Thanh or Thành, 'Nguyen' may be Nguyễn or
+    Nguyên. Only Unicode form, spacing and punctuation stuck to a word ('(Ha') are cleaned,
+    and a name written all in capitals is shown as 'Trần Thị Bích'.
     """
-    Restores Vietnamese accents for personal names.
-    E.g. 'Tran Van Yen'    -> 'Trần Văn Yên'
-         'Nguyen Van Thuy' -> 'Nguyễn Văn Thúy'
-         'Hoang Tien Vinh' -> 'Hoàng Tiến Vinh'
-         'Bo Vi Thutdng'   -> 'Đỗ Vi Thượng'
-    """
-    if not raw_name:
-        return ""
-        
-    cleaned = raw_name.strip()
-    words = cleaned.split()
-    if not words:
-        return ""
+    words = [re.sub(r"^\W+|\W+$", "", word) for word in unicodedata.normalize("NFC", raw_name or "").split()]
+    name = " ".join(word for word in words if word)
+    if name.isupper():
+        name = " ".join(word.capitalize() for word in name.split())
+    return name
 
-    restored_words = []
-    num_words = len(words)
-
-    for idx, w in enumerate(words):
-        w_clean = re.sub(r"[^A-Za-z0-9àáảãạâầấẩẫậăằắẳẵặèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđĐ]", "", w)
-        w_lower = w_clean.lower()
-
-        # If word already has accents, preserve it capitalized
-        if re.search(r"[àáảãạâầấẩẫậăằắẳẵặèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđĐ]", w_clean):
-            restored_words.append(w_clean.capitalize())
-            continue
-
-        # Rule 1: First word is typically Surname
-        if idx == 0 and w_lower in VIETNAMESE_SURNAMES:
-            restored_words.append(VIETNAMESE_SURNAMES[w_lower])
-        # Rule 2: Last word is typically Given Name
-        elif idx == num_words - 1 and w_lower in VIETNAMESE_GIVEN_NAMES:
-            restored_words.append(VIETNAMESE_GIVEN_NAMES[w_lower])
-        # Rule 3: Middle words
-        elif w_lower in VIETNAMESE_MIDDLE_NAMES:
-            restored_words.append(VIETNAMESE_MIDDLE_NAMES[w_lower])
-        elif w_lower in VIETNAMESE_GIVEN_NAMES:
-            restored_words.append(VIETNAMESE_GIVEN_NAMES[w_lower])
-        elif w_lower in VIETNAMESE_SURNAMES:
-            restored_words.append(VIETNAMESE_SURNAMES[w_lower])
-        else:
-            # Fallback capitalize
-            restored_words.append(w_clean.capitalize())
-
-    return " ".join(restored_words)
 
 def normalize_vietnamese_address(raw_addr: str) -> str:
     """
@@ -132,7 +60,8 @@ def normalize_vietnamese_address(raw_addr: str) -> str:
     # Clean spacing and punctuation
     addr = re.sub(r"\s+", " ", addr)
     if "Tỉnh" in addr and not addr.startswith("Tỉnh") and ", Tỉnh" not in addr:
-        addr = addr.replace(" Tỉnh", ", Tỉnh")
+        # Add a comma only where the address has no separator of its own ("- Tỉnh" stays).
+        addr = re.sub(r"(?<=[^\s,;\-–])\s+(?=Tỉnh\b)", ", ", addr)
         
     return addr.strip()
 

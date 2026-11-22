@@ -9,14 +9,20 @@ echo        BUILD UNG DUNG SO HOA GPLX
 echo ================================================
 echo.
 
+REM Uu tien moi truong ao cua du an (.venv), neu khong co moi dung Python tren PATH.
+set "PY=%~dp0.venv\Scripts\python.exe"
+if exist "%PY%" goto have_python
+set "PY=python"
 where python >nul 2>&1
 if errorlevel 1 goto missing_python
 
-python -m PyInstaller --version >nul 2>&1
+:have_python
+echo Python: %PY%
+"%PY%" -m PyInstaller --version >nul 2>&1
 if errorlevel 1 goto missing_pyinstaller
 
 echo Dang build va cap nhat goi "So Hoa GPLX"...
-python "%~dp0build_portable.py"
+"%PY%" "%~dp0build_portable.py"
 if errorlevel 1 goto build_failed
 
 if not exist "%~dp0So Hoa GPLX\app\GPLX_SoHoa_TraCuu.exe" goto missing_output
@@ -28,12 +34,14 @@ echo Mo file "Chay_Ngay.bat" trong goi de chay ung dung.
 goto finish
 
 :missing_python
-echo Khong tim thay Python tren PATH. Hay cai Python va thu lai.
+echo Khong tim thay .venv hoac Python tren PATH. Tao moi truong ao:
+echo     python -m venv .venv
+echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
 goto failed
 
 :missing_pyinstaller
 echo Khong tim thay PyInstaller. Cai dat bang lenh:
-echo     python -m pip install pyinstaller
+echo     "%PY%" -m pip install -r requirements.txt
 goto failed
 
 :build_failed

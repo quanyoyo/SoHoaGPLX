@@ -24,7 +24,7 @@ def main():
         init_digitization_structure()
 
         app = GPLXApp()
-        app.mainloop()
+        app.run()
         logger.info("Application closed normally")
     except Exception as exc:
         logger.critical("Application startup or event loop failed", exc_info=True)

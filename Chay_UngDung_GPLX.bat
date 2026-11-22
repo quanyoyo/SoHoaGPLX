@@ -12,7 +12,10 @@ echo [*] Đang kiểm tra môi trường và khởi chạy ứng dụng...
 
 cd /d "%~dp0"
 
-REM Kiểm tra nếu có Python
+REM Ưu tiên môi trường ảo của dự án (.venv)
+set "PY=%~dp0.venv\Scripts\python.exe"
+if exist "%PY%" goto run_app
+set "PY=python"
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [!] KHÔNG TÌM THẤY PYTHON TRÊN MÁY TÍNH NÀY!
@@ -21,8 +24,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+:run_app
 REM Khởi chạy ứng dụng Desktop
-start "" python app_desktop.py
+start "" "%PY%" app_desktop.py
 
 echo [*] Ứng dụng đã được khởi chạy thành công!
 timeout /t 3 >nul

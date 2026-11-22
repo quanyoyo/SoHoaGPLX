@@ -1,0 +1,17 @@
+# Versions tested with the project's .venv (Python on Windows).
+# Install: .venv\Scripts\python.exe -m pip install -r requirements.txt
+customtkinter==6.0.0
+fastapi==0.165.0
+numpy==2.5.5
+onnxruntime==1.32.0
+opencv-python==5.1.0.95
+openpyxl==3.1.5
+pillow==13.0.0
+pypdfium2==5.15.2
+qrcode==8.2
+rapidocr-onnxruntime==1.2.3
+uvicorn==0.54.0
+
+# Build and tests
+pyinstaller==6.22.3
+httpx2==2.16.2
