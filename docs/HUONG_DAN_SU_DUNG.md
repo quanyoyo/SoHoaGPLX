@@ -19,8 +19,8 @@ Hệ thống được thiết kế chuyên biệt phục vụ công tác số h�
 4. **Đổi tên thật, an toàn khi lỗi**:
    - File PDF scan được **đổi tên hẳn** sang tên chuẩn ngay trong thư mục của nó (không giữ bản mang tên scan cũ); file Excel con được tạo cạnh đó.
    - Nếu lưu sổ tổng hợp hoặc Excel bị lỗi, file PDF được đổi về tên cũ. Đã có file khác trùng tên thì phần mềm báo lỗi, không ghi đè.
-5. **Xuất Excel động trung thực theo bảng scan**:
-   - Tự động sinh file Excel con (`.xlsx`) phản ánh trung thực thứ tự cột, nội dung và số trang PDF của tài liệu gốc. Hỗ trợ tài liệu có nhiều danh sách độc lập thành nhiều sheet tương ứng.
+5. **Gộp danh sách thành một & Xuất Excel chuẩn mực**:
+   - Tự động gộp toàn bộ các trang và bảng trong file scan thành **1 danh sách công dân duy nhất** cho mỗi hồ sơ, ghép cột thông minh theo vị trí in trên giấy (chỉ 8–10 cột chuẩn). File Excel con (`.xlsx`) xuất ra chỉ gồm đúng 1 sheet `"Danh sách GPLX"` tiện lợi cho quản lý, đối chiếu và in ấn. Excel cũ lưu nhiều sheet vẫn mở và tự động gộp khi đọc.
 6. **Sổ theo dõi dãy số GPLX cấp tỉnh (Master Summary)**:
    - Tự động tạo và cập nhật file Excel tổng hợp `So_Theo_Doi_Day_So_GPLX_<MãTỉnh>.xlsx` với 12 cột chuẩn, tự động phân tích dãy số liên tục ("Đủ") hay ngắt quãng ("Ngắt, không theo thứ tự").
 7. **Tra cứu siêu tốc & 1-Click lật đúng trang PDF**:
@@ -80,7 +80,7 @@ Gói ứng dụng bàn giao chuẩn được tổ chức như sau:
 ## 4. QUY TRÌNH SỐ HÓA & ĐỔI TÊN HỒ SƠ (TAB 1)
 
 Giao diện Tab 1 gồm **3 khung làm việc song song**:
-- **Khung 1 (Trái - 246 khi mở lần đầu)**: Hàng đợi danh sách file và các nút chọn thư mục, chạy OCR.
+- **Khung 1 (Trái - 246 khi mở lần đầu)**: Hàng đợi danh sách file và các nút chọn thư mục, chạy OCR. Hàng đợi chia 2 danh sách: **"Đang xử lý (n)"** và **"Đã xong (n)"** (bấm để chuyển).
 - **Khung 2 (Giữa - phần còn lại, 630 trên màn hình rộng)**: Trình xem trước bản scan PDF (phóng to/thu nhỏ, xoay trang, cuộn 2 chiều).
 - **Khung 3 (Phải - 510 khi mở lần đầu)**: Màn hình rà soát bìa sổ, dải số và bảng dữ liệu công dân (thấy khoảng 55% bề ngang bảng khi mở lần đầu).
 
@@ -103,11 +103,17 @@ Có **2 luồng xử lý chính** tùy theo nhu cầu nghiệp vụ:
     * Thẻ **Tên file đề xuất**: Xem tên file chuẩn được sinh tự động. Có thể chỉnh sửa trực tiếp nếu muốn. Bên dưới là các ghi chú đặt tên: các mục **chữ đỏ** dưới tiêu đề **"Cần sửa trước khi lưu:"** là việc bắt buộc phải làm trước khi lưu (ví dụ chưa chọn mã tỉnh, cần nhập ngày thi), không có lỗi thì khung này trống. Nếu OCR đọc được mã tỉnh trên giấy tờ, lỗi mã tỉnh ghi kèm gợi ý, ví dụ "Chưa chọn mã tỉnh lưu trữ (OCR gợi ý: 15 – Tỉnh Lào Cai).".
     * Thẻ **Thông tin bìa sổ & Vị trí hồ sơ**: Kiểm tra Loại sổ, Ngày thi, Hạng, Khóa, Hộp, Hộp số, Mã tỉnh lưu trữ và các ô đặt tên (Số quyết định, Ngày ký, Số GPLX đầu/cuối).
     * Ô **Ngày thi** nhập theo dạng **dd-mm-yyyy** (ví dụ `29-03-1996`). Ô **Số GPLX đầu/cuối** nhập **chữ in hoa**, 1–2 chữ cái và 6 chữ số liền nhau (ví dụ `AM570000`). Nhập sai dạng thì khung ghi chú báo lỗi đỏ và chưa lưu được.
-    * Thẻ **Rà soát dãy số GPLX & Nhận định**: Kiểm tra Tổng số GPLX, Nhận định, Dãy số GPLX. **Tổng số GPLX** tự điền bằng số dòng đọc được ở mọi danh sách; nếu Nhận định là "Cần rà soát" thì hãy đối chiếu lại số này. Các số này tính cho **cả cuốn sổ**: PDF có nhiều danh sách vẫn ra một tên file (số GPLX đầu của danh sách đầu đến số cuối của danh sách cuối), một dòng sổ tổng hợp và một file Excel (mỗi danh sách một sheet). Nhận định **"Cần rà soát"** nghĩa là máy chưa kết luận được "Đủ" hay "Ngắt" (còn trang chưa rõ, dòng tô vàng hoặc ô số GPLX đọc chưa rõ). Bấm các nút **"Đối chiếu trang n"** để xem những trang còn chưa rõ danh sách có tiếp tục hay không.
-    * Thẻ **Danh sách trong PDF (giữ nguyên cột của bảng gốc)**: Bảng đối soát từng dòng người dân. Bấm chọn một dòng thì khung PDF nhảy đến trang của dòng đó để đối chiếu ảnh scan; nhấp đúp vào ô để sửa. Dòng tô vàng là dòng cần đối chiếu, dòng tô xanh là dòng đã sửa. Sổ có nhiều danh sách thì chọn danh sách để xem ở ô "Đang xem" (chỉ đổi bảng đang hiển thị, không ảnh hưởng tên file).
+    * Thẻ **Rà soát dãy số GPLX & Nhận định**: Kiểm tra Tổng số GPLX và Nhận định (dãy số GPLX do máy tự tính khi lưu, không cần nhập). **Tổng số GPLX** tự điền bằng số dòng đọc được ở mọi danh sách; nếu Nhận định là "Cần rà soát" thì hãy đối chiếu lại số này. Các số này tính cho **cả cuốn sổ**: PDF có nhiều trang/bảng vẫn ra một tên file (số GPLX đầu của danh sách đến số cuối của danh sách), một dòng sổ tổng hợp và một file Excel (chỉ 1 sheet "Danh sách GPLX" gộp cả cuốn sổ). Nếu có nút **"✔ Nhận n số GPLX gợi ý"**: máy thấy n số GPLX đọc sai mà các số liền trước, liền sau chỉ ra số đúng (số trong danh sách thường tăng dần 1); trong bảng các ô này hiện `số đọc → số gợi ý?` và tô vàng. Đối chiếu nhanh với ảnh scan rồi bấm nút để nhận tất cả; số nào gợi ý chưa đúng thì nhấp đúp vào ô để sửa tay trước khi bấm. Nhận định **"Cần rà soát"** nghĩa là máy chưa kết luận được "Đủ" hay "Ngắt" (còn trang chưa rõ, dòng tô vàng hoặc ô số GPLX đọc chưa rõ). Bấm các nút **"Đối chiếu trang n"** để xem những trang còn chưa rõ danh sách có tiếp tục hay không.
+    * Thẻ **Danh sách trong PDF (giữ nguyên cột của bảng gốc)**: Bảng đối soát từng dòng người dân. Bấm chọn một dòng thì khung PDF nhảy đến trang của dòng đó để đối chiếu ảnh scan; nhấp đúp vào ô để sửa. Dòng tô vàng là dòng cần đối chiếu, dòng tô xanh là dòng đã sửa. Bảng hiển thị toàn bộ danh sách gộp của cuốn sổ; ô "Đang xem (n danh sách)" tự động ẩn khi chỉ có 1 danh sách.
 * **Bước 4: Xác nhận lưu**:
   * Bấm nút **`✔ XÁC NHẬN: ĐỔI TÊN PDF & XUẤT EXCEL & CẬP NHẬT TỔNG HỢP`** (nút chỉ bấm được khi đã nhập đủ các ô bắt buộc).
-  * Phần mềm đổi tên file PDF sang tên chuẩn, tạo file Excel con `.xlsx`, ghi dòng vào Sổ tổng hợp của tỉnh và nạp vào CSDL để tra cứu ngay.
+  * Phần mềm đổi tên file PDF sang tên chuẩn, tạo file Excel con `.xlsx`, ghi dòng vào Sổ tổng hợp của tỉnh và nạp vào CSDL để tra cứu ngay. File chuyển sang danh sách **"Đã xong"**.
+* **Bước 5: Xem lại hồ sơ đã lưu, sửa Excel rồi cập nhật sổ tổng hợp**:
+  * Bấm **"Đã xong (n)"** ở hàng đợi rồi bấm vào file: phần mềm hiện lại thông tin đã lưu (đọc từ Excel và sổ tổng hợp, **không quét OCR lại**). Các ô chỉ để xem.
+  * **`📂 Mở file Excel`**: mở Excel con để sửa danh sách (sửa số GPLX, thêm/xóa dòng). Sửa xong nhớ bấm **Lưu** trong Excel.
+  * **`🔄 Cập nhật sổ tổng hợp từ Excel`**: tính lại Tổng số GPLX (số dòng), dãy số GPLX và Nhận định từ Excel, ghi đè đúng dòng của hồ sơ trong sổ tổng hợp và cập nhật CSDL tra cứu. Các cột khác của sổ giữ nguyên. Excel còn ô số GPLX trống hoặc sai dạng thì Nhận định là "Cần rà soát". Nếu Excel còn đang mở, phần mềm nhắc: chỉ phần đã bấm Lưu trong Excel được tính.
+  * **`✏ Sửa lại hồ sơ (đọc lại PDF)`**: quét OCR lại để sửa thông tin bìa (hộp, hạng, mã tỉnh…) rồi xác nhận lưu đè như lần đầu.
+  * Nút **`🔄 Cập nhật tất cả từ Excel`** (ở danh sách "Đã xong") cập nhật sổ tổng hợp cho mọi file đã xong trong thư mục đang mở.
 
 ---
 
@@ -119,6 +125,7 @@ Có **2 luồng xử lý chính** tùy theo nhu cầu nghiệp vụ:
 3. Bấm vào từng file để xem bản scan ở giữa và thông tin bìa/vị trí hồ sơ ở cột phải.
 4. Kiểm tra mã tỉnh, ngày thi/ngày ký để hệ thống tự động sinh tên chuẩn. Bạn có thể chỉnh sửa trực tiếp các ô trước khi xác nhận.
 5. Bấm nút **`XÁC NHẬN LƯU PDF VÀ SỔ TỔNG HỢP`**: Ứng dụng đổi tên file PDF sang tên chuẩn, cập nhật dòng vào `So_Theo_Doi_Day_So_GPLX_<MãTỉnh>.xlsx` ở thư mục tỉnh, ghi thông tin hồ sơ vào CSDL (không có danh sách công dân) và tự động chuyển sang file kế tiếp.
+6. File đã lưu nằm ở **"Đã xong"**; bấm vào để xem lại thông tin đã lưu (không quét OCR). Muốn sửa thì bấm **`✏ Sửa lại hồ sơ (đọc lại PDF)`**.
 
 ---
 
@@ -158,7 +165,7 @@ Tab 2 cung cấp 2 chế độ tra cứu toàn diện:
 ### 6.2. Chế độ 2: 📁 Danh Mục Sổ / File Excel Đã Import
 * **Thống kê tổng thể**: Hiển thị tổng số Tỉnh, Hộp, Hộp số và tổng số lượng hồ sơ/file Excel đã số hóa trong CSDL.
 * **Nút `👥 Xem Dân`**: Bấm vào nút này để lọc và xem toàn bộ danh sách người dân có trong cuốn sổ đó.
-* **Nút `🔄 Quét lại từ Excel`**: Cho phép quét và đồng bộ lại CSDL từ các file Excel trong thư mục khi bạn có chỉnh sửa dữ liệu thủ công bên ngoài bằng Microsoft Excel.
+* **Nút `🔄 Quét lại từ Excel`**: Cho phép quét và đồng bộ lại CSDL từ các file Excel trong thư mục khi bạn có chỉnh sửa dữ liệu thủ công bên ngoài bằng Microsoft Excel. Nút này chỉ cập nhật CSDL tra cứu; muốn sổ tổng hợp tỉnh khớp với Excel đã sửa thì dùng nút **`🔄 Cập nhật sổ tổng hợp từ Excel`** ở Tab 1 (mục 4.1, Bước 5).
 
 ---
 

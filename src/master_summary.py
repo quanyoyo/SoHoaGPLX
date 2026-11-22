@@ -454,6 +454,28 @@ def write_summary_entry(workbook, record: Dict[str, Any], previous_filename=None
     _sync_table(ws, _last_data_row(ws))
 
 
+def update_summary_counts(summary_file_path: str, pdf_filename: str, *, total_licenses, license_sequence,
+                          status_note) -> None:
+    """Columns 8 (total), 9 (GPLX numbers) and 11 (status) of one dossier, from its edited Excel.
+
+    The other columns keep what is there, also values typed in the summary by hand.
+    """
+    with edit_master_summary(summary_file_path) as workbook:
+        ws = _summary_sheet(workbook)
+        rows = summary_rows_by_name(workbook).get(_filename_key(pdf_filename), [])
+        if len(rows) != 1:
+            raise ValueError(f"Sổ tổng hợp {'không có' if not rows else 'có nhiều'} dòng {pdf_filename}.")
+        row = rows[0]
+        for column, value in ((8, total_licenses), (9, license_sequence), (11, status_note)):
+            cell = ws.cell(row, column)
+            cell.value = value
+            if isinstance(value, str):
+                cell.data_type = "s"
+        stamp = ws.cell(row, len(HEADERS))
+        stamp.value = datetime.now().replace(second=0, microsecond=0)
+        stamp.number_format = _DATETIME_FORMAT
+
+
 def update_or_append_summary_entry(summary_file_path: str, record: Dict[str, Any]) -> str:
     with edit_master_summary(summary_file_path) as workbook:
         write_summary_entry(workbook, record)

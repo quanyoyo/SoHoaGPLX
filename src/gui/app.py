@@ -21,7 +21,10 @@ from src.gui.pdf_viewer import PDFViewerFrame
 from src.gui.review_panel import ReviewPanel
 from src.gui.search_screen import SearchScreenFrame
 from src.gui.lan_screen import LANScreenFrame
-from src.pipeline import StalePdfError, process_dossier_pdf, commit_dossier, commit_folder_dossier
+from src.pipeline import (
+    StalePdfError, commit_dossier, commit_folder_dossier, load_saved_dossier, process_dossier_pdf,
+    refresh_summary_from_excel,
+)
 from src.logger import get_logger, set_exception_notifier
 
 logger = get_logger(__name__)
@@ -118,6 +121,7 @@ class GPLXApp(ctk.CTk):
             on_worker_start=self._worker_started,
             on_worker_finish=self._worker_finished,
             on_batch_stop_callback=self.on_batch_stop_requested,
+            on_refresh_all_callback=self._refresh_summaries,
         )
         self.paned.add(self.sidebar, stretch="never")
 
@@ -131,7 +135,8 @@ class GPLXApp(ctk.CTk):
             self.paned,
             width=510,
             on_confirm_callback=self.on_confirm_commit,
-            on_page_jump_callback=self.on_page_jump
+            on_page_jump_callback=self.on_page_jump,
+            on_saved_action_callback=self.on_saved_action,
         )
         self.paned.add(self.review, stretch="never")
         self.pane_widths = self._load_pane_widths()
@@ -271,9 +276,120 @@ class GPLXApp(ctk.CTk):
                 self.review.set_saving(True)
         elif item["status"] == "PROCESSING":
             self.review.clear_data("Đang đọc thông tin PDF…")
-        elif item["status"] in {"PENDING", "ERROR", "COMPLETED"}:
-            # A saved PDF is read again so it can be corrected and saved again.
+        elif item["status"] == "COMPLETED":
+            # What was saved is shown from its Excel and summary; "Sửa lại hồ sơ" reads the PDF again.
+            self._load_saved_async(item)
+        elif item["status"] in {"PENDING", "ERROR"}:
             self._process_single_file_async(file_path)
+
+    def _load_saved_async(self, item):
+        self.review.clear_data("Đang đọc hồ sơ đã lưu…")
+        path = item["path"]
+
+        def worker():
+            try:
+                data = load_saved_dossier(path)
+            except Exception as exc:
+                logger.exception("Could not read saved dossier %s", path)
+                self._dispatch_to_ui(self._on_saved_error, item, path, str(exc))
+                return
+            self._dispatch_to_ui(self._on_saved_loaded, item, path, data)
+
+        self._launch_worker(worker)
+
+    def _on_saved_loaded(self, item, path, data):
+        if self._is_active(item) and item["path"] == path and item["status"] == "COMPLETED":
+            self.review.load_data(data)
+
+    def _on_saved_error(self, item, path, error):
+        if not (self._is_active(item) and item["path"] == path):
+            return
+        self.review.clear_data("Không đọc được hồ sơ đã lưu.")
+        if messagebox.askyesno("Không đọc được hồ sơ đã lưu",
+                               f"{item['filename']}\n\n{error}\n\nĐọc lại PDF bằng OCR để sửa và lưu lại?"):
+            self._process_single_file_async(path)
+
+    def on_saved_action(self, action):
+        """Buttons of a saved dossier shown in the review panel."""
+        item = self.active_item
+        if item is None:
+            return
+        if action == "open_excel":
+            excel = (self.review.current_data or {}).get("excel_path")
+            if excel:
+                try:
+                    os.startfile(excel)
+                except OSError as exc:
+                    messagebox.showerror("Không mở được file Excel", f"{excel}\n\n{exc}")
+        elif action == "refresh":
+            self._refresh_summaries([item])
+        elif action == "reread":
+            self._process_single_file_async(item["path"])
+
+    @staticmethod
+    def _excel_open_in_excel(pdf_path):
+        """Excel keeps a lock file ~$<name>.xlsx next to a workbook it has open."""
+        excel = os.path.splitext(pdf_path)[0] + ".xlsx"
+        folder, name = os.path.split(excel)
+        return any(os.path.exists(os.path.join(folder, lock)) for lock in ("~$" + name, "~$" + name[2:]))
+
+    def _refresh_summaries(self, items):
+        """Count, GPLX numbers and status of each Excel go to the province summary and the database."""
+        items = list(items)
+        if not items:
+            messagebox.showinfo("Cập nhật sổ tổng hợp", "Không có hồ sơ đã xong để cập nhật.")
+            return
+        if open_now := [item for item in items if self._excel_open_in_excel(item["path"])]:
+            names = "\n".join(f"• {os.path.splitext(item['filename'])[0]}.xlsx" for item in open_now[:10])
+            if not messagebox.askokcancel(
+                    "File Excel đang mở",
+                    f"File Excel đang mở trong Excel:\n{names}\n\n"
+                    "Chỉ phần đã bấm Lưu trong Excel được tính. Tiếp tục cập nhật?"):
+                return
+        elif len(items) > 1 and not messagebox.askokcancel(
+                "Cập nhật tất cả", f"Cập nhật sổ tổng hợp từ Excel cho {len(items)} hồ sơ đã xong?"):
+            return
+        paths = [(item, item["path"]) for item in items]
+
+        def worker():
+            results, errors = [], []
+            for item, path in paths:
+                try:
+                    results.append((item, refresh_summary_from_excel(path)))
+                except Exception as exc:
+                    logger.warning("Could not refresh the summary from %s", path, exc_info=True)
+                    errors.append((item, str(exc)))
+            self._dispatch_to_ui(self._finish_refresh, results, errors)
+
+        self._launch_worker(worker)
+
+    def _finish_refresh(self, results, errors):
+        try:
+            self.search_screen.refresh_results()
+            self.search_screen.refresh_stats()
+            self.lan_screen.refresh_state()
+        except Exception:
+            logger.exception("Could not refresh statistics after updating summaries")
+        name = lambda item: os.path.splitext(item["filename"])[0]
+        lines = [f"Đã cập nhật {len(results)} / {len(results) + len(errors)} hồ sơ."]
+        if len(results) == 1 and not errors:
+            result = results[0][1]
+            lines += [f"• Tổng số GPLX: {result['total_licenses']}",
+                      f"• Số GPLX trong file: {result['license_sequence'] or '(trống)'}",
+                      f"• Nhận định: {result['status_note']}"]
+        lines += [f"• {name(item)}: chưa cập nhật CSDL tra cứu ({result['db_error']})"
+                  for item, result in results if result.get("db_error")]
+        lines += [f"• {name(item)}: {error}" for item, error in errors[:15]]
+        if len(errors) > 15:
+            lines.append(f"… và {len(errors) - 15} hồ sơ khác.")
+        if errors or any(result.get("db_error") for _item, result in results):
+            messagebox.showwarning("Cập nhật sổ tổng hợp", "\n".join(lines))
+        else:
+            messagebox.showinfo("Cập nhật sổ tổng hợp", "\n".join(lines))
+        active = self.active_item
+        if (active is not None and self._is_active(active) and any(item is active for item, _r in results)
+                and (self.review.current_data or {}).get("saved_view")):
+            self._load_saved_async(active)  # show the new count, numbers and status
 
     def _process_single_file_async(self, file_path: str):
         item = self.sidebar.get_item(file_path)

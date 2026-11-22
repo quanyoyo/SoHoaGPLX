@@ -19,7 +19,7 @@ from openpyxl.utils import get_column_letter
 
 from src.logger import get_logger
 from src.pdf_processor import open_pdf, page_count, render_pdf_page
-from src.table_extractor import table_citizens
+from src.table_extractor import merge_tables, table_citizens
 
 WORKBOOK_METADATA = "_GPLX"
 WORKBOOK_VERSION = "GPLX/3"
@@ -350,6 +350,8 @@ def _write_source_list(ws, table, reviewed, dossier_meta, get_page):
             cell = ws.cell(index, col)
             _write_text(cell, value)
             cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if col - 1 in row.get("absent_columns", ()):
+                continue  # a column only the other lists of the PDF have
             if role in ("photo", "signature"):
                 bounds = row.get("bounds", [])
                 _add_media(ws, cell, role, row, bounds[col - 1] if col <= len(bounds) else None, get_page)
@@ -369,7 +371,8 @@ def generate_excel_companion(dossier_meta, citizens, output_path, *, source_tabl
     """Export the original columns, with explicitly reviewed corrections and page provenance."""
     if source_tables is None:
         return _generate_legacy_companion(dossier_meta, citizens, output_path)
-    tables = source_tables or [{"columns": [], "rows": []}]
+    # One sheet for the whole PDF: its lists are one dossier (rows in the same order as citizens).
+    tables = merge_tables(source_tables) or [{"columns": [], "rows": []}]
     if sum(len(table["rows"]) for table in tables) != len(citizens):
         raise ValueError("Số dòng đã duyệt không khớp bảng nguồn. Hãy đọc lại hồ sơ trước khi xuất Excel.")
     workbook = Workbook()
@@ -378,7 +381,7 @@ def generate_excel_companion(dossier_meta, citizens, output_path, *, source_tabl
         start = 0
         for index, table in enumerate(tables, 1):
             ws = workbook.active if index == 1 else workbook.create_sheet()
-            ws.title = f"Danh sách GPLX {index}"
+            ws.title = "Danh sách GPLX" if len(tables) == 1 else f"Danh sách GPLX {index}"
             end = start + len(table["rows"])
             _write_source_list(ws, table, citizens[start:end], dossier_meta, get_page)
             start = end

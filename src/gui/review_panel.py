@@ -2,6 +2,7 @@
 Review & Quick Edit Panel (Right Column).
 Displays extracted metadata, proposed filename, sequence analysis, and editable citizen grid.
 """
+import os
 import tkinter as tk
 from tkinter import StringVar, messagebox, ttk
 from typing import Dict, Any, List, Callable, Optional
@@ -14,7 +15,7 @@ from src.naming_rules import (
     DOSSIER_GROUPS, format_exam_date, is_valid_windows_filename_stem, propose_dossier_filename, typed_format_errors,
 )
 from src.pipeline import summarize_license_tables
-from src.table_extractor import apply_cell_edit, table_citizens
+from src.table_extractor import apply_cell_edit, suggest_license_numbers, table_citizens
 
 ERRORS_HEADING = "Cần sửa trước khi lưu:"
 
@@ -29,11 +30,13 @@ def naming_errors(fields):
 
 
 class ReviewPanel(ctk.CTkFrame):
-    def __init__(self, master, on_confirm_callback: Callable, on_page_jump_callback: Callable, **kwargs):
+    def __init__(self, master, on_confirm_callback: Callable, on_page_jump_callback: Callable,
+                 on_saved_action_callback: Optional[Callable] = None, **kwargs):
         super().__init__(master, **kwargs)
         
         self.on_confirm_callback = on_confirm_callback
         self.on_page_jump_callback = on_page_jump_callback
+        self.on_saved_action_callback = on_saved_action_callback
         self.current_data: Optional[Dict[str, Any]] = None
         self.citizen_entries: List[Dict[str, Any]] = []
         self.grid_tree = None
@@ -152,13 +155,21 @@ class ReviewPanel(ctk.CTkFrame):
         )
         self.opt_status_note.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        ctk.CTkLabel(self.card_b, text="Dãy số GPLX:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        self.txt_seq_summary = ctk.CTkEntry(self.card_b, height=28)
-        self.txt_seq_summary.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        # No "Dãy số GPLX" box: the sequence is computed from the lists when saving, and again from the
+        # edited Excel by "Cập nhật sổ tổng hợp từ Excel".
         # The PDF's lists are one dossier: a button for each page still to check, in every list.
         self.table_pages_frame = ctk.CTkFrame(self.card_b, fg_color="transparent")
         self.table_pages_frame.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 4))
         self.table_pages_frame.grid_remove()
+
+        # GPLX numbers the neighbouring rows point to (OCR read them wrong): accepted all at once.
+        self._suggestions = {}  # id(table) -> {row index: suggested number}
+        self.btn_accept_suggestions = ctk.CTkButton(
+            self.card_b, text="", height=28, fg_color="#B45309", hover_color="#92400E",
+            font=("Segoe UI", 12, "bold"), command=self._accept_suggestions,
+        )
+        self.btn_accept_suggestions.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 4))
+        self.btn_accept_suggestions.grid_remove()
 
         self.card_b.grid_columnconfigure(1, weight=1)
 
@@ -186,10 +197,48 @@ class ReviewPanel(ctk.CTkFrame):
         )
         self.btn_confirm.pack(fill="x", padx=10, pady=8)
 
+        # A saved dossier is only shown: the Excel is edited, then the summary is updated from it.
+        self.saved_buttons = [
+            ctk.CTkButton(self.bottom_bar, text=text, font=("Segoe UI", 12, "bold"), height=32, fg_color=color,
+                          command=lambda action=action: self._saved_action(action))
+            for text, action, color in (
+                ("📂 Mở file Excel", "open_excel", "#1F6FB2"),
+                ("🔄 Cập nhật sổ tổng hợp từ Excel", "refresh", "#0F766E"),
+                ("✏ Sửa lại hồ sơ (đọc lại PDF)", "reread", "#B45309"),
+            )
+        ]
+
+    def _saved_action(self, action):
+        if self.on_saved_action_callback and self.current_data and self.current_data.get("saved_view"):
+            self.on_saved_action_callback(action)
+
+    def _inputs(self):
+        """Every box of the form with its state when it can be typed in."""
+        return [(widget, "normal") for widget in (
+            self.txt_proposed_filename, self.txt_book_type, self.txt_cover_date, self.txt_hang, self.txt_khoa,
+            self.txt_box, self.txt_box_number, self.txt_total_gplx, self.opt_status_note, self.chk_province,
+            *(entry for _caption, entry in self.group_fields.values()),
+        )] + [(self.cmb_province, "readonly")]
+
+    def _show_saved_view(self, saved, has_excel=False):
+        if saved:
+            self.btn_confirm.pack_forget()
+            for button, action in zip(self.saved_buttons, ("open_excel", "refresh", "reread")):
+                if action == "reread" or has_excel:
+                    button.pack(fill="x", padx=10, pady=(6 if button is self.saved_buttons[0] else 2, 2))
+                else:
+                    button.pack_forget()
+        else:
+            for button in self.saved_buttons:
+                button.pack_forget()
+            self.btn_confirm.pack(fill="x", padx=10, pady=8)
+
     def load_data(self, dossier_data: Dict[str, Any]):
         self.current_data = None
         self._saving = False
-        self.txt_proposed_filename.configure(state="normal")
+        self._show_saved_view(False)
+        for widget, state in self._inputs():
+            widget.configure(state=state)  # boxes locked for a saved dossier are filled again
         self._show_form()
         # Values typed before switching to another file are shown again (store_draft).
         cover = {**dossier_data.get("cover_meta", {}), **dossier_data.get("review_draft", {})}
@@ -233,9 +282,11 @@ class ReviewPanel(ctk.CTkFrame):
             self.lbl_card_c.pack_forget()
             self.grid_frame.pack_forget()
             self._clear_grid()
+            self._find_suggestions([])
         else:
             self.lbl_card_c.pack(anchor="w", pady=(10, 2))
             self.grid_frame.pack(fill="both", expand=True, pady=2)
+            self._find_suggestions(dossier_data.get("tables", []), shown=not dossier_data.get("saved_view"))
             self._populate_grid(dossier_data.get("tables", []))
 
         self.current_data = dossier_data
@@ -243,14 +294,25 @@ class ReviewPanel(ctk.CTkFrame):
         if draft := dossier_data.get("review_filename"):
             self.txt_proposed_filename.delete(0, "end")
             self.txt_proposed_filename.insert(0, draft)
+        if dossier_data.get("saved_view"):
+            # The saved name, not one built again from the boxes.
+            self.txt_proposed_filename.delete(0, "end")
+            self.txt_proposed_filename.insert(0, os.path.splitext(os.path.basename(dossier_data["original_path"]))[0])
+            note = "Hồ sơ đã lưu: chỉ xem. " + (
+                "Sửa Excel rồi bấm Cập nhật, hoặc bấm Sửa lại để đọc lại PDF." if dossier_data.get("excel_path")
+                else "Bấm Sửa lại để đọc lại PDF.")
+            self.lbl_naming.configure(text=note)
+            self._render_naming_lines([(note, False)])
+            for widget, _state in self._inputs():
+                widget.configure(state="disabled")
+            self.cmb_group.configure(state="disabled")
+            self._show_saved_view(True, has_excel=bool(dossier_data.get("excel_path")))
 
     def _show_table_summary(self, cover):
         self.txt_total_gplx.delete(0, "end")
         if cover.get("total_licenses") is not None:
             self.txt_total_gplx.insert(0, str(cover["total_licenses"]))
         self.opt_status_note.set(cover.get("status_note") or "Cần rà soát")
-        self.txt_seq_summary.delete(0, "end")
-        self.txt_seq_summary.insert(0, cover.get("license_sequence", ""))
 
     def _show_table_pages(self, tables):
         for button in self.table_pages_frame.winfo_children():
@@ -288,6 +350,8 @@ class ReviewPanel(ctk.CTkFrame):
     def _refresh_naming(self, *_, update_filename=True):
         if not self.current_data or self._saving:
             return
+        if self.current_data.get("saved_view") and self.txt_box.cget("state") == "disabled":
+            return  # shown as saved
         fields = self._naming_inputs()
         suggested = fields["suggested_province_code"]
         if fields["province_code"] and suggested and fields["province_code"] != suggested:
@@ -339,6 +403,11 @@ class ReviewPanel(ctk.CTkFrame):
         try:
             for widget in self.naming_notes_frame.winfo_children():
                 widget.destroy()
+            # An empty frame keeps its default height (200): shown only when there is a line to show.
+            if items:
+                self.naming_notes_frame.pack(fill="x", padx=10, pady=(0, 6))
+            else:
+                self.naming_notes_frame.pack_forget()
             for text, is_required in items:
                 lbl = ctk.CTkLabel(
                     self.naming_notes_frame,
@@ -369,6 +438,9 @@ class ReviewPanel(ctk.CTkFrame):
     def clear_data(self, message="Chọn PDF để xem và rà soát."):
         self.current_data = None
         self._saving = False
+        self._show_saved_view(False)
+        for widget, state in self._inputs():
+            widget.configure(state=state)
         self.txt_proposed_filename.configure(state="normal")
         self.txt_proposed_filename.delete(0, "end")
         self.lbl_naming.configure(text=message)
@@ -376,6 +448,7 @@ class ReviewPanel(ctk.CTkFrame):
         if callable(render_fn):
             render_fn([(message, False)] if message else [])
         self._show_table_pages([])
+        self._find_suggestions([])
         self.scroll_form.pack_forget()
         self.btn_confirm.configure(text="XÁC NHẬN", state="disabled", fg_color="gray50")
 
@@ -491,21 +564,52 @@ class ReviewPanel(ctk.CTkFrame):
         tree.column("page", stretch=False, anchor="center")
         self._apply_grid_scaling()
         for index, row in enumerate(table["rows"]):
-            tree.insert("", "end", iid=str(index), values=self._grid_values(table, row), tags=self._grid_tags(row))
+            tree.insert("", "end", iid=str(index), values=self._grid_values(table, row, index),
+                        tags=self._grid_tags(table, row, index))
 
-    @staticmethod
-    def _grid_values(table, row):
-        values = [("(ảnh)" if c["role"] in ("photo", "signature") and value else value)
+    def _suggestion(self, table, index):
+        return self._suggestions.get(id(table), {}).get(index)
+
+    def _grid_values(self, table, row, index):
+        suggestion = self._suggestion(table, index)
+        values = [("(ảnh)" if c["role"] in ("photo", "signature") and value else
+                   f"{value} → {suggestion}?" if suggestion and c["role"] == "license_number" else value)
                   for c, value in zip(table["columns"], row["cells"])]
         return [*values, row["page_number"]]
 
-    @staticmethod
-    def _grid_tags(row):
+    def _grid_tags(self, table, row, index):
         if row.get("_edited"):
             return ("edited",)
-        if row.get("license_state") in ("uncertain", "unknown_column") or not row.get("identity_confident", True):
+        if (row.get("license_state") in ("uncertain", "unknown_column") or not row.get("identity_confident", True)
+                or self._suggestion(table, index)):
             return ("review",)
         return ()
+
+    def _find_suggestions(self, tables, shown=True):
+        """GPLX numbers the neighbours point to, in every list; the button accepts them all."""
+        self._suggestions = {id(table): found for table in tables if (found := suggest_license_numbers(table))}
+        count = sum(map(len, self._suggestions.values())) if shown else 0
+        if not shown:
+            self._suggestions = {}
+        if count:
+            self.btn_accept_suggestions.configure(text=f"✔ Nhận {count} số GPLX gợi ý")
+            self.btn_accept_suggestions.grid()
+        else:
+            self.btn_accept_suggestions.grid_remove()
+
+    def _accept_suggestions(self):
+        if not self.current_data or self._saving or self.current_data.get("saved_view"):
+            return
+        self._finish_cell_edit()
+        tables = self.current_data.get("tables", [])
+        for table in tables:
+            column = [c["role"] for c in table["columns"]].index("license_number") if id(table) in self._suggestions else None
+            for index, number in self._suggestions.get(id(table), {}).items():
+                apply_cell_edit(table, table["rows"][index], column, number)
+        self._find_suggestions(tables)
+        if self._grid_table is not None:
+            self._show_grid_table(self._grid_table)
+        self._refresh_table_stats()
 
     def _jump_to_selected_row(self, _event=None):
         if self._cell_editor is not None or not self.grid_tree or self._grid_table is None:
@@ -516,6 +620,8 @@ class ReviewPanel(ctk.CTkFrame):
 
     def _start_cell_edit(self, event):
         tree = self.grid_tree
+        if self.current_data and self.current_data.get("saved_view"):
+            return  # a saved list is corrected in its Excel
         if tree is None or tree.identify_region(event.x, event.y) != "cell":
             return
         item, column_id = tree.identify_row(event.y), tree.identify_column(event.x)
@@ -548,7 +654,14 @@ class ReviewPanel(ctk.CTkFrame):
         if not save or value == row["cells"][col_index]:
             return
         apply_cell_edit(table, row, col_index, value)
-        self.grid_tree.item(str(row_index), values=self._grid_values(table, row), tags=self._grid_tags(row))
+        if table["columns"][col_index]["role"] == "license_number":
+            # A corrected number can make or answer a suggestion anywhere in the list.
+            self._find_suggestions(self.current_data.get("tables", []))
+            self._show_grid_table(table)
+            self.grid_tree.see(str(row_index))
+        else:
+            self.grid_tree.item(str(row_index), values=self._grid_values(table, row, row_index),
+                                tags=self._grid_tags(table, row, row_index))
         # A GPLX number changes the range; a corrected name can complete the count and the status.
         if table["columns"][col_index]["role"] in ("license_number", "full_name"):
             self._refresh_table_stats()
@@ -569,7 +682,7 @@ class ReviewPanel(ctk.CTkFrame):
 
     def store_draft(self):
         """Keep what was typed with the file before another file is shown. Nothing is saved to disk."""
-        if not self.current_data or self._saving:
+        if not self.current_data or self._saving or self.current_data.get("saved_view"):
             return
         self._finish_cell_edit()
         group = self.cmb_group.get()
@@ -585,29 +698,18 @@ class ReviewPanel(ctk.CTkFrame):
             "box_number": self.txt_box_number.get().strip(),
             "total_licenses": self.txt_total_gplx.get().strip() or None,
             "status_note": self.opt_status_note.get().strip(),
-            "license_sequence": self.txt_seq_summary.get().strip(),
         }
         self.current_data["review_filename"] = self.txt_proposed_filename.get().strip()
 
     def _missing_fields(self):
         """Labels of required boxes left empty. "-" records that the paper does not show the value."""
-        cover = self.current_data["cover_meta"]
-        rename_only = self.current_data.get("rename_only")
-        endpoints = all(self.naming_fields[field].get().strip() for field in ("first_license_no", "last_license_no"))
-        missing = []
-        for entry, label in ((self.txt_book_type, "Loại sổ"), (self.txt_hang, "Hạng"), (self.txt_khoa, "Khóa"),
-                             (self.txt_box, "Hộp"), (self.txt_box_number, "Hộp số"),
-                             (self.txt_total_gplx, "Tổng số GPLX"), (self.txt_seq_summary, "Dãy số GPLX")):
-            if entry.get().strip():
-                continue
-            # A verified blank GPLX column has no range; a quick rename writes "Đầu … · Cuối …" itself.
-            if entry is self.txt_seq_summary and (cover.get("license_column_empty") or (rename_only and endpoints)):
-                continue
-            missing.append(label)
-        return missing
+        return [label for entry, label in (
+            (self.txt_book_type, "Loại sổ"), (self.txt_hang, "Hạng"), (self.txt_khoa, "Khóa"),
+            (self.txt_box, "Hộp"), (self.txt_box_number, "Hộp số"), (self.txt_total_gplx, "Tổng số GPLX"),
+        ) if not entry.get().strip()]
 
     def _handle_confirm(self):
-        if not self.current_data or self._saving:
+        if not self.current_data or self._saving or self.current_data.get("saved_view"):
             return
         # Apply a cell still being edited first: a corrected GPLX number can change the filename.
         self._finish_cell_edit()
@@ -638,7 +740,6 @@ class ReviewPanel(ctk.CTkFrame):
         cover["box"] = self.txt_box.get().strip()
         cover["box_number"] = self.txt_box_number.get().strip()
         cover["status_note"] = self.opt_status_note.get().strip()
-        cover["license_sequence"] = self.txt_seq_summary.get().strip()
         count = self.txt_total_gplx.get().strip()
         if count and count != "-" and not (len(count) <= 12 and count.isascii() and count.isdecimal()):
             messagebox.showwarning("Số lượng không hợp lệ", "Nhập tổng số GPLX bằng số nguyên không âm, hoặc \"-\" nếu giấy tờ không ghi.")

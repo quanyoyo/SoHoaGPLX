@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 
 import sqlite3
 
+import customtkinter as ctk
 import openpyxl
 
 from src.config import find_province_code_by_text
@@ -395,6 +396,64 @@ class FolderReviewControllerTest(unittest.TestCase):
         self.addCleanup(frame.destroy)
         return frame
 
+    @staticmethod
+    def shown(panel):
+        return [panel.file_tree.item(row, "values")[1] for row in panel.file_tree.get_children()]
+
+    def test_done_files_have_their_own_list(self):
+        panel = self.sidebar()
+        token = panel._folder_scan = object()
+        panel._finish_folder_scan(token, [("a.pdf", "a.pdf"), ("b.pdf", None), ("c.pdf", None)], None, False)
+        self.assertEqual(panel.view_switch.cget("values"), ["Đang xử lý (2)", "Đã xong (1)"])
+        self.assertEqual((panel.view_switch.get(), self.shown(panel)), ("Đang xử lý (2)", ["b", "c"]))
+        self.assertEqual(panel.lbl_stats.cget("text"), "Đã duyệt: 1 / 3 file")
+        self.assertEqual(panel.btn_refresh_all.winfo_manager(), "", "only shown with the done files")
+
+        panel._on_view_switch("Đã xong (1)")
+        self.assertEqual(self.shown(panel), ["a"])
+        self.assertEqual(panel.btn_refresh_all.winfo_manager(), "pack")
+        panel._on_view_switch("Đang xử lý (2)")
+
+        b = panel.get_item("b.pdf")
+        panel.update_entry(b, "COMPLETED")  # saved
+        self.assertEqual(panel.view_switch.cget("values"), ["Đang xử lý (1)", "Đã xong (2)"])
+        self.assertEqual(self.shown(panel), ["c"])
+
+        # The file shown in the viewer is always in the list on screen.
+        panel.show_active(panel.get_item("a.pdf"))
+        self.assertEqual((panel.view_switch.get(), self.shown(panel)), ("Đã xong (2)", ["a", "b"]))
+        self.assertEqual(panel.file_tree.selection(), (panel.file_tree.get_children()[0],))
+        panel._on_file_enter()
+        panel.on_select_file_callback.assert_called_with("a.pdf")
+
+        # A done file read again to be corrected is worked on in the first list.
+        panel.update_entry(panel.get_item("a.pdf"), "PROCESSING")
+        panel.show_active(panel.get_item("a.pdf"))
+        self.assertEqual(panel.view_switch.get(), "Đang xử lý (2)")
+        self.assertIn("a", self.shown(panel))
+
+    def test_a_folder_of_saved_files_opens_on_the_done_list(self):
+        panel = self.sidebar()
+        token = panel._folder_scan = object()
+        panel._finish_folder_scan(token, [("a.pdf", "a.pdf"), ("b.pdf", "b.pdf")], None, False)
+        self.assertEqual((panel.view_switch.get(), self.shown(panel)), ("Đã xong (2)", ["a", "b"]))
+
+    def test_refresh_all_sends_the_done_digitized_files(self):
+        refresh = Mock()
+        panel = BatchQueueFrame(self.root, on_select_file_callback=Mock(), on_batch_start_callback=Mock(),
+                                dispatch_to_ui=lambda callback, *args: callback(*args),
+                                on_worker_start=Mock(), on_worker_finish=Mock(), on_refresh_all_callback=refresh)
+        self.addCleanup(panel.destroy)
+        token = panel._folder_scan = object()
+        panel._finish_folder_scan(token, [("a.pdf", "a.pdf"), ("b.pdf", None), ("c.pdf", "c.pdf")], None, False)
+        panel._on_view_switch("Đã xong (2)")
+        panel.btn_refresh_all.invoke()
+        refresh.assert_called_once_with([panel.get_item("a.pdf"), panel.get_item("c.pdf")])
+        # Quick rename keeps no Excel: nothing to update from.
+        token = panel._folder_scan = object()
+        panel._finish_folder_scan(token, [("a.pdf", "a.pdf")], None, True)
+        self.assertEqual(panel.btn_refresh_all.winfo_manager(), "")
+
     def test_rename_button_label(self):
         self.assertEqual(self.sidebar().btn_rename_folder.cget("text"), "📑 Đổi tên file nhanh (chọn theo folder)")
 
@@ -525,25 +584,185 @@ class FolderReviewControllerTest(unittest.TestCase):
         panel.load_data(data)
         return panel, data
 
+    def saved_panel(self, rename_only=False):
+        action = Mock()
+        panel = ReviewPanel(self.root, on_confirm_callback=Mock(), on_page_jump_callback=Mock(),
+                            on_saved_action_callback=action)
+        self.addCleanup(panel.destroy)
+        rows = [] if rename_only else [{
+            "cells": ["1", "Nguyễn Văn A", "C244537"], "page_number": 2, "stt": None, "identity_confident": True,
+            "license_number": "C244537", "license_state": "valid", "scores": [], "bounds": []}]
+        tables = [] if rename_only else [{"columns": [{"label": "STT", "role": "stt"},
+                                                      {"label": "Họ và tên", "role": "full_name"},
+                                                      {"label": "Số GPLX", "role": "license_number"}], "rows": rows}]
+        data = {"original_path": "D:/kho/15.SQL.03.1996.C244537-C244537.pdf", "saved_view": True,
+                "rename_only": rename_only, "tables": tables,
+                "excel_path": None if rename_only else "D:/kho/15.SQL.03.1996.C244537-C244537.xlsx",
+                "cover_meta": {"province_code": "15", "exam_date": "22-03-1996", "dossier_group": "SQL",
+                               "book_type": "Sổ gốc", "box": "49", "box_number": "116", "license_class": "A1",
+                               "course": "26", "total_licenses": 1, "license_sequence": "C244537",
+                               "status_note": "Đủ"}}
+        panel.load_data(data)
+        return panel, action, data
+
+    def test_a_saved_dossier_is_shown_read_only(self):
+        panel, action, data = self.saved_panel()
+        self.assertEqual(panel.txt_proposed_filename.get(), "15.SQL.03.1996.C244537-C244537")
+        self.assertEqual((panel.txt_box.get(), panel.txt_total_gplx.get(), panel.opt_status_note.get()),
+                         ("49", "1", "Đủ"))
+        for widget in (panel.txt_proposed_filename, panel.txt_book_type, panel.txt_cover_date, panel.txt_hang,
+                       panel.txt_khoa, panel.txt_box, panel.txt_box_number, panel.cmb_province, panel.cmb_group,
+                       panel.opt_status_note, panel.txt_total_gplx):
+            self.assertEqual(widget.cget("state"), "disabled", widget)
+        self.assertEqual(panel.btn_confirm.winfo_manager(), "", "nothing to confirm")
+        self.assertEqual([b.cget("text") for b in panel.saved_buttons],
+                         ["📂 Mở file Excel", "🔄 Cập nhật sổ tổng hợp từ Excel", "✏ Sửa lại hồ sơ (đọc lại PDF)"])
+        self.assertTrue(all(b.winfo_manager() == "pack" for b in panel.saved_buttons))
+        self.assertEqual(panel.naming_notes_frame.winfo_children()[0].cget("text"),
+                         "Hồ sơ đã lưu: chỉ xem. Sửa Excel rồi bấm Cập nhật, hoặc bấm Sửa lại để đọc lại PDF.")
+        # The grid is not edited in place: the Excel is.
+        panel.update_idletasks()
+        row = panel.grid_tree.get_children()[0]
+        x, y, _w, _h = panel.grid_tree.bbox(row, "#2") or (5, 5, 0, 0)
+        panel._start_cell_edit(SimpleNamespace(x=x + 2, y=y + 2))
+        self.assertIsNone(panel._cell_editor)
+        panel.store_draft()
+        self.assertNotIn("review_draft", data, "nothing typed to keep")
+        for index, name in enumerate(("open_excel", "refresh", "reread")):
+            panel.saved_buttons[index].invoke()
+            action.assert_called_with(name)
+        # A file read by OCR afterwards can be edited again.
+        panel.load_data({"original_path": "b.pdf", "tables": [], "rename_only": True,
+                         "cover_meta": {"province_code": "15", "exam_date": "15-09-2015"}})
+        self.assertEqual((panel.txt_box.cget("state"), panel.cmb_province.cget("state"),
+                          panel.opt_status_note.cget("state")), ("normal", "readonly", "normal"))
+        self.assertEqual(panel.btn_confirm.winfo_manager(), "pack")
+        self.assertTrue(all(b.winfo_manager() == "" for b in panel.saved_buttons))
+
+    def test_a_saved_quick_rename_has_no_excel_buttons(self):
+        panel, _action, _data = self.saved_panel(rename_only=True)
+        self.assertEqual([b.cget("text") for b in panel.saved_buttons if b.winfo_manager()],
+                         ["✏ Sửa lại hồ sơ (đọc lại PDF)"])
+
+    def test_clicking_a_done_file_shows_what_was_saved_without_ocr(self):
+        item = {"path": "a.pdf", "filename": "a.pdf", "status": "COMPLETED", "saved_pdf": "a.pdf", "data": None}
+        app = SimpleNamespace(active_item=None, active_file_path=None, review=Mock(), viewer=Mock(),
+                              sidebar=SimpleNamespace(show_active=Mock(), get_item=lambda path: item),
+                              _process_single_file_async=Mock(), _load_saved_async=Mock())
+        GPLXApp.on_file_selected(app, "a.pdf")
+        app._load_saved_async.assert_called_once_with(item)
+        app._process_single_file_async.assert_not_called()
+
+        app._is_active = lambda it: GPLXApp._is_active(app, it)
+        app._launch_worker = lambda work, **_kw: work()
+        app._dispatch_to_ui = lambda callback, *args: callback(*args)
+        for name in ("_on_saved_loaded", "_on_saved_error"):
+            setattr(app, name, getattr(GPLXApp, name).__get__(app))
+        app.active_item = item
+        with patch("src.gui.app.load_saved_dossier", return_value={"saved_view": True}) as load, \
+                patch("src.gui.app.process_dossier_pdf") as ocr:
+            GPLXApp._load_saved_async(app, item)
+        load.assert_called_once_with("a.pdf")
+        ocr.assert_not_called()
+        app.review.load_data.assert_called_once_with({"saved_view": True})
+        # Data that cannot be read: the PDF may be read again on request.
+        with patch("src.gui.app.load_saved_dossier", side_effect=ValueError("Không đọc được file Excel a.xlsx")), \
+                patch("src.gui.app.messagebox.askyesno", return_value=True) as ask:
+            GPLXApp._load_saved_async(app, item)
+        self.assertIn("Không đọc được file Excel a.xlsx", ask.call_args.args[1])
+        app._process_single_file_async.assert_called_once_with("a.pdf")
+
+    def test_saved_view_buttons(self):
+        item = {"path": "D:/kho/a.pdf", "filename": "a.pdf", "status": "COMPLETED", "saved_pdf": "D:/kho/a.pdf"}
+        app = SimpleNamespace(active_item=item, active_file_path="D:/kho/a.pdf", review=Mock(),
+                              _process_single_file_async=Mock(), _refresh_summaries=Mock())
+        app.review.current_data = {"excel_path": "D:/kho/a.xlsx", "saved_view": True}
+        with patch("src.gui.app.os.startfile") as start:
+            GPLXApp.on_saved_action(app, "open_excel")
+        start.assert_called_once_with("D:/kho/a.xlsx")
+        GPLXApp.on_saved_action(app, "refresh")
+        app._refresh_summaries.assert_called_once_with([item])
+        GPLXApp.on_saved_action(app, "reread")
+        app._process_single_file_async.assert_called_once_with("D:/kho/a.pdf")
+
+    def test_summaries_are_refreshed_from_the_excels_and_reported(self):
+        with TemporaryDirectory() as folder:
+            a, b = os.path.join(folder, "a.pdf"), os.path.join(folder, "b.pdf")
+            items = [{"path": a, "filename": "a.pdf", "status": "COMPLETED"},
+                     {"path": b, "filename": "b.pdf", "status": "COMPLETED"}]
+            app = SimpleNamespace(active_item=items[0], review=Mock(), search_screen=Mock(), lan_screen=Mock(),
+                                  _load_saved_async=Mock())
+            app._is_active = lambda it: it is app.active_item
+            app.sidebar = SimpleNamespace(get_item=lambda path: next((i for i in items if i["path"] == path), None))
+            app.review.current_data = {"saved_view": True}
+            app._launch_worker = lambda work, **_kw: work()
+            app._dispatch_to_ui = lambda callback, *args: callback(*args)
+            app._finish_refresh = lambda results, errors: GPLXApp._finish_refresh(app, results, errors)
+            app._excel_open_in_excel = GPLXApp._excel_open_in_excel
+
+            # An Excel still open in Excel: only what was saved there counts.
+            Path(folder, "~$a.xlsx").write_bytes(b"")
+            with patch("src.gui.app.messagebox.askokcancel", return_value=False) as ask, \
+                    patch("src.gui.app.refresh_summary_from_excel") as refresh:
+                GPLXApp._refresh_summaries(app, items)
+            self.assertIn("a.xlsx", ask.call_args.args[1])
+            refresh.assert_not_called()
+
+            def refresh_one(path):
+                if path == b:
+                    raise ValueError("Sổ tổng hợp đang mở")
+                return {"total_licenses": 4, "license_sequence": "C1-C4", "status_note": "Đủ", "db_error": None}
+            with patch("src.gui.app.messagebox.askokcancel", return_value=True), \
+                    patch("src.gui.app.refresh_summary_from_excel", side_effect=refresh_one), \
+                    patch("src.gui.app.messagebox.showwarning") as warning:
+                GPLXApp._refresh_summaries(app, items)
+            report = warning.call_args.args[1]
+            self.assertIn("Đã cập nhật 1 / 2 hồ sơ", report)
+            self.assertIn("b: Sổ tổng hợp đang mở", report)
+            app._load_saved_async.assert_called_once_with(items[0])  # the open file shows the new values
+            app.search_screen.refresh_results.assert_called_once()
+
     def test_every_box_must_be_filled_before_saving(self):
         confirm = Mock()
         panel, _data = self._quick_rename_panel(confirm)
         with patch("src.gui.review_panel.messagebox.showwarning") as warning:
             panel._handle_confirm()
         confirm.assert_not_called()
-        self.assertIn("Khóa, Tổng số GPLX, Dãy số GPLX", warning.call_args.args[1])
+        self.assertIn("Hãy nhập: Khóa, Tổng số GPLX.", warning.call_args.args[1])
+        self.assertNotIn("Dãy số", warning.call_args.args[1], "the sequence is computed, not typed")
         self.assertIn('"-"', warning.call_args.args[1])
         # "-" records that the paper does not show the value.
-        for entry in (panel.txt_khoa, panel.txt_total_gplx, panel.txt_seq_summary):
+        for entry in (panel.txt_khoa, panel.txt_total_gplx):
             entry.insert(0, "-")
         with patch("src.gui.review_panel.messagebox.showwarning") as warning:
             panel._handle_confirm()
         warning.assert_not_called()
         cover = confirm.call_args.kwargs["cover_meta"]
-        self.assertEqual((cover["course"], cover["total_licenses"], cover["license_sequence"]), ("-", "-", "-"))
+        self.assertEqual((cover["course"], cover["total_licenses"], cover["license_sequence"]), ("-", "-", ""))
         from src.pipeline import _summary_record
         record = _summary_record("15.368.25.09.2015", cover, 0, folder_review=True)
-        self.assertEqual((record["total_licenses"], record["license_sequence"]), ("-", "-"))
+        self.assertEqual(record["total_licenses"], "-")
+
+    def test_the_sequence_is_computed_not_typed(self):
+        confirm = Mock()
+        panel = ReviewPanel(self.root, on_confirm_callback=confirm, on_page_jump_callback=Mock())
+        self.addCleanup(panel.destroy)
+        self.assertFalse(hasattr(panel, "txt_seq_summary"))
+        texts = [w.cget("text") for w in panel.card_b.winfo_children() if isinstance(w, ctk.CTkLabel)]
+        self.assertNotIn("Dãy số GPLX:", texts)
+        columns = [{"label": "STT", "role": "stt"}, {"label": "Họ và tên", "role": "full_name"},
+                   {"label": "Số GPLX", "role": "license_number"}]
+        table = {"columns": columns, "rows": [
+            {"cells": [str(i), f"Người {i}", code], "scores": [1.0] * 3, "bounds": [(0, 0, 1, 1)] * 3, "page_number": 2,
+             "stt": i, "identity_confident": True, "license_number": code, "license_state": "valid"}
+            for i, code in ((1, "C244537"), (2, "C244538"), (3, "C244540"))]}
+        stats = summarize_license_tables([table])
+        stats.pop("sequence_analysis")
+        panel.load_data({"original_path": "x.pdf", "tables": [table], "rename_only": False,
+                         "cover_meta": {"province_code": "15", "exam_date": "01-04-1996", "license_class": "A1",
+                                        "course": "K1", "box": "49", "box_number": "116", **stats}})
+        panel._handle_confirm()
+        self.assertEqual(confirm.call_args.kwargs["cover_meta"]["license_sequence"], "C244537-C244538; C244540")
 
     def test_typed_values_are_kept_when_switching_to_another_file(self):
         panel, first = self._quick_rename_panel()
@@ -576,6 +795,23 @@ class FolderReviewControllerTest(unittest.TestCase):
         panel.txt_box.insert(0, "49")
         panel._refresh_naming()
         self.assertEqual(panel.naming_notes_frame.winfo_children(), [])
+
+    def test_the_empty_notes_box_takes_no_room(self):
+        # Lỗi 33: with no error the empty notes frame kept its default height (400 px at Scale 200%).
+        first = self.book_table((1, "Nguyễn Văn A", "C244537", 2, True), (2, "Lê Văn C", "C244538", 2, True))
+        panel = self.book(first)
+        panel.update_idletasks()
+        self.assertEqual(panel.btn_confirm.cget("state"), "normal", "nothing to fix")
+        self.assertEqual((panel.naming_notes_frame.winfo_children(), panel.naming_notes_frame.winfo_manager()), ([], ""))
+        # An error shows the box again, under the file name.
+        panel.cmb_province.set("Chọn mã tỉnh")
+        panel._on_province_selected(None)
+        self.assertEqual(panel.naming_notes_frame.winfo_manager(), "pack")
+        self.assertEqual(panel.naming_notes_frame.pack_info()["in"], panel.banner_frame)
+        self.assertEqual(panel.banner_frame.pack_slaves()[-1], panel.naming_notes_frame)
+        # A message (no file open, saved dossier) is shown in it too.
+        panel.clear_data("Chọn PDF để xem và rà soát.")
+        self.assertEqual(panel.naming_notes_frame.winfo_manager(), "pack")
 
     def test_naming_notes_show_only_the_errors_in_red(self):
         panel, data = self._quick_rename_panel()
@@ -652,6 +888,32 @@ class FolderReviewControllerTest(unittest.TestCase):
         if unresolved:
             table["unresolved_pages"] = unresolved
         return table
+
+    def test_gplx_numbers_the_neighbours_point_to_are_suggested_and_accepted_together(self):
+        table = self.book_table((1, "Nguyễn Văn A", "AG982435", 2, True), (2, "Lê Văn B", "", 2, True),
+                                (3, "Hà Văn C", "AG982437", 3, True), (4, "Lò Văn D", "AG982413", 3, True),
+                                (5, "Vi Văn E", "AG982439", 3, True), (6, "Lý Văn F", "AG982440", 3, True))
+        unclear = table["rows"][1]
+        unclear["cells"][3], unclear["license_state"] = "AG98240", "uncertain"
+        panel = self.book(table)
+        tree = panel.grid_tree
+        shown = lambda row: tree.item(str(row), "values")[3]
+        self.assertEqual((shown(1), shown(3)), ("AG98240 → AG982436?", "AG982413 → AG982438?"))
+        self.assertIn("review", tree.item("3", "tags"), "a valid number the neighbours contradict is checked too")
+        button = panel.btn_accept_suggestions
+        self.assertEqual((button.winfo_manager(), button.cget("text")), ("grid", "✔ Nhận 2 số GPLX gợi ý"))
+        button.invoke()
+        self.assertEqual([r["cells"][3] for r in table["rows"]],
+                         ["AG982435", "AG982436", "AG982437", "AG982438", "AG982439", "AG982440"])
+        self.assertEqual([r["license_state"] for r in table["rows"]], ["valid"] * 6)
+        self.assertEqual((shown(1), tree.item("1", "tags")), ("AG982436", ("edited",)))
+        self.assertEqual(button.winfo_manager(), "", "nothing left to accept")
+        self.assertEqual((panel.opt_status_note.get(), panel.txt_proposed_filename.get()),
+                         ("Đủ", "15.SQL.04.1996.AG982435-AG982440"))
+
+    def test_a_saved_dossier_has_no_suggestions_to_accept(self):
+        panel, _action, data = self.saved_panel()
+        self.assertEqual(panel.btn_accept_suggestions.winfo_manager(), "")
 
     def test_several_lists_are_named_and_summarized_as_one_book(self):
         import tkinter as tk
@@ -982,22 +1244,26 @@ class FolderReviewControllerTest(unittest.TestCase):
         with patch.object(panel, "_rebuild_rows", side_effect=AssertionError("the list is not filled again")):
             panel.update_entry(item, "READY")
             self.assertEqual(panel.file_tree.item(rows[1], "values")[0], "👁 Duyệt")
-            item.update(path="15.SQL.05.2010.A1-A2.pdf", filename="15.SQL.05.2010.A1-A2.pdf", saved_pdf="x")
-            panel.update_entry(item, "COMPLETED")
+            panel.update_entry(item, "SAVING")
         self.assertEqual(panel.file_tree.get_children(), rows)
-        self.assertEqual(tuple(panel.file_tree.item(rows[1], "values")), ("✅ Xong", "15.SQL.05.2010.A1-A2"))
-        self.assertEqual(tags(rows[1]), ("COMPLETED",))
-        self.assertEqual(panel.lbl_stats.cget("text"), "Đã duyệt: 1 / 3 file")
-        panel.file_tree.selection_set(rows[1])
-        panel._on_file_enter()
-        panel.on_select_file_callback.assert_called_with("15.SQL.05.2010.A1-A2.pdf")
+        self.assertEqual(panel.file_tree.item(rows[1], "values")[0], "💾 Đang lưu")
         # The open file stays marked while the arrow keys move on.
         panel.show_active(item)
-        self.assertEqual(tags(rows[1]), ("COMPLETED", "active"))
+        self.assertEqual(tags(rows[1]), ("SAVING", "active"))
         panel.file_tree.selection_set(rows[2])
         self.assertIn("active", tags(rows[1]))
+        # Saved: the file moves to the done list under its new name.
+        item.update(path="15.SQL.05.2010.A1-A2.pdf", filename="15.SQL.05.2010.A1-A2.pdf", saved_pdf="x")
+        panel.update_entry(item, "COMPLETED")
+        self.assertEqual(panel.lbl_stats.cget("text"), "Đã duyệt: 1 / 3 file")
+        self.assertEqual(panel.view_switch.get(), "Đã xong (1)", "the open file stays on screen")
+        row, = panel.file_tree.get_children()
+        self.assertEqual(tuple(panel.file_tree.item(row, "values")), ("✅ Xong", "15.SQL.05.2010.A1-A2"))
+        self.assertEqual(tags(row), ("COMPLETED", "active"))
+        panel._on_file_enter()
+        panel.on_select_file_callback.assert_called_with("15.SQL.05.2010.A1-A2.pdf")
         panel.show_active(None)
-        self.assertEqual(tags(rows[1]), ("COMPLETED",))
+        self.assertEqual(tags(row), ("COMPLETED",))
         self.assertEqual(panel.file_tree.selection(), ())
 
     def test_a_long_file_list_is_one_table(self):

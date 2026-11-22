@@ -48,6 +48,7 @@ htmlcov/
 *.db-journal
 *.db-wal
 *.db-shm
+HeThong/SaoLuu/
 
 # 7. Operating System temporary files (Windows & macOS)
 Thumbs.db

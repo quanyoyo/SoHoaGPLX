@@ -16,10 +16,13 @@ import openpyxl
 
 from datetime import date
 from src.config import DATABASE_BACKUP_DIR, DATABASE_PATH, LEGACY_DATABASE_PATHS, get_handover_root_dir
-from src.excel_generator import METADATA_FIELDS, PAGE_ROLE, REVIEW_ROLE, ROLE_ROW, WORKBOOK_METADATA, WORKBOOK_VERSION
+from src.excel_generator import (
+    HEADER_ROW, METADATA_FIELDS, PAGE_ROLE, REVIEW_ROLE, ROLE_ROW, WORKBOOK_METADATA, WORKBOOK_VERSION,
+)
 from src.logger import get_logger
 from src.naming_rules import LICENSE_NUMBER
 from src.pdf_processor import get_pdf_page_count
+from src.sequence_analyzer import summarize_license_numbers
 from src.table_extractor import project_citizen, source_column_role
 
 logger = get_logger(__name__)
@@ -100,6 +103,54 @@ def _read_source_workbook(workbook, total_pages):
     if not found_table:
         raise ValueError("Không tìm thấy sheet danh sách GPLX có thông tin trang PDF.")
     return cover, citizens
+
+
+def read_saved_tables(workbook):
+    """The lists of a saved Excel as shown in the review panel: its own columns, cells and PDF pages."""
+    tables = []
+    for sheet in workbook.worksheets:
+        if sheet.sheet_state != "visible":
+            continue
+        rows = sheet.iter_rows(min_row=ROLE_ROW, values_only=True)
+        roles = [_excel_text(value) for value in next(rows, ())]
+        if PAGE_ROLE not in roles or REVIEW_ROLE not in roles:
+            continue
+        labels = [_excel_text(value) for value in next(rows, ())]
+        width = roles.index(PAGE_ROLE)
+        license_index = roles.index("license_number") if roles[:width].count("license_number") == 1 else None
+        table = {"columns": [{"label": labels[i] if i < len(labels) else "", "role": roles[i]} for i in range(width)],
+                 "rows": []}
+        for values in rows:
+            values = (*values, *[None] * (width + 1 - len(values)))
+            cells = [_excel_text(value) for value in values[:width]]
+            if not any(cells):
+                continue
+            number = _lookup_license(cells[license_index]) if license_index is not None else ""
+            state = "valid" if LICENSE_NUMBER.fullmatch(number) else "uncertain" if number else "blank"
+            table["rows"].append({
+                "cells": cells, "page_number": _excel_positive_int(values[width], 1), "stt": None,
+                "identity_confident": True, "license_number": number if state == "valid" else "",
+                "license_state": state, "scores": [], "bounds": [],
+            })
+        tables.append(table)
+    return tables
+
+
+def read_dossier_workbook(excel_path: str, pdf_path: str):
+    """(cover fields, citizens) of a saved Excel. The sequence and status follow its rows as edited."""
+    total_pages = get_pdf_page_count(pdf_path)
+    # Read a copy: an open handle would stop a save on another machine from replacing this Excel.
+    with open(excel_path, "rb") as handle:
+        content = io.BytesIO(handle.read())
+    workbook = openpyxl.load_workbook(content, read_only=True, data_only=True)
+    try:
+        reader = _read_source_workbook if WORKBOOK_METADATA in workbook.sheetnames else _read_legacy_workbook
+        cover_meta, citizens = reader(workbook, total_pages)
+    finally:
+        workbook.close()
+    cover_meta["total_pages"] = total_pages
+    cover_meta.update(summarize_license_numbers([citizen["license_number"] for citizen in citizens]))
+    return cover_meta, citizens
 
 
 def _read_legacy_workbook(workbook, total_pages):
@@ -790,17 +841,7 @@ class DatabaseManager:
         return restored
 
     def _index_single_excel(self, excel_path: str, pdf_path: str, final_filename: str):
-        total_pages = get_pdf_page_count(pdf_path)
-        # Read a copy: an open handle would stop a save on another machine from replacing this Excel.
-        with open(excel_path, "rb") as handle:
-            content = io.BytesIO(handle.read())
-        workbook = openpyxl.load_workbook(content, read_only=True, data_only=True)
-        try:
-            reader = _read_source_workbook if WORKBOOK_METADATA in workbook.sheetnames else _read_legacy_workbook
-            cover_meta, citizens = reader(workbook, total_pages)
-        finally:
-            workbook.close()
-        cover_meta["total_pages"] = total_pages
+        cover_meta, citizens = read_dossier_workbook(excel_path, pdf_path)
 
         self.insert_or_update_dossier(
             final_filename=final_filename,

@@ -92,3 +92,22 @@ def analyze_license_sequences(license_list: List[str]) -> Dict[str, Any]:
         "total_count": total_count,
         "ranges": ranges
     }
+
+
+_LICENSE = re.compile(r"[A-Z]{1,2}[0-9]{6}")
+
+
+def summarize_license_numbers(numbers: List[str]) -> Dict[str, str]:
+    """Sequence and status of the GPLX numbers of a list read back from its Excel.
+
+    A number that is empty or not 1-2 letters + 6 digits leaves the status "Cần rà soát"; the
+    sequence then shows the valid numbers. A list without any number has no data.
+    """
+    valid = [number for number in numbers if _LICENSE.fullmatch(number or "")]
+    if not valid:
+        return {"license_sequence": "", "status_note": "Không có dữ liệu"}
+    sequence = analyze_license_sequences(valid)
+    return {
+        "license_sequence": sequence["sequence_summary"],
+        "status_note": sequence["status"] if len(valid) == len(numbers) else "Cần rà soát",
+    }

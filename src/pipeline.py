@@ -16,15 +16,16 @@ import openpyxl
 from src.pdf_processor import open_pdf, page_count, read_pdf_page_text, render_pdf_page
 from src.ocr_engine import run_ocr
 from src.cover_parser import parse_cover_ocr, parse_cover_page_text
-from src.table_extractor import LicenseTableExtractor, measure_page_grid, table_citizens
+from src.table_extractor import LicenseTableExtractor, measure_page_grid, merge_tables, table_citizens
 from src.naming_rules import STANDARD_DOSSIER_PDF, is_valid_windows_filename_stem, propose_dossier_filename
 from src.excel_generator import generate_excel_companion
 from src.folder_parser import folder_review_location
 from src.sequence_analyzer import analyze_license_sequences
 from src.master_summary import (
-    edit_master_summary, read_rename_records, register_dossier_name, summary_rows_by_name, write_summary_entry,
+    edit_master_summary, read_rename_records, register_dossier_name, summary_rows_by_name, update_summary_counts,
+    write_summary_entry,
 )
-from src.database import DatabaseManager
+from src.database import DatabaseManager, read_dossier_workbook, read_saved_tables
 from src.config import PROVINCE_CODES
 from src.logger import get_logger
 
@@ -148,7 +149,9 @@ def summarize_license_tables(tables):
     last = states[-1]
     return {
         "first_license_no": rows[0]["license_number"] if rows else "",
-        "last_license_no": last["rows"][-1]["license_number"] if last["rows"] and not last["unresolved"] else "",
+        # A page to check after the last row may continue the list; one inside the book does not move its end.
+        "last_license_no": last["rows"][-1]["license_number"] if last["rows"] and not any(
+            page > last["rows"][-1]["page_number"] for page in last["unresolved"]) else "",
         "license_column_empty": blank and known_count,
         "license_sequence": sequence["sequence_summary"],
         "status_note": "Cần rà soát" if warning and not blank else sequence["status"],
@@ -177,7 +180,8 @@ def process_dossier_pdf(pdf_path: str, default_province: str = "", *, rename_onl
     cached_cover, total_pages, _ = _cached_opening(key)
     cover_meta = deepcopy(cached_cover)
     # Quick rename reads the opening page only; the GPLX range and counts are typed by the user.
-    tables = [] if rename_only else deepcopy(_cached_tables(key))
+    # Every list of the PDF is one dossier: reviewed and saved as one list.
+    tables = [] if rename_only else merge_tables(deepcopy(_cached_tables(key)))
     all_citizens = [row for table in tables for row in table_citizens(table)]
     
     cover_meta["suggested_province_code"] = cover_meta["province_code"]
@@ -521,6 +525,87 @@ def list_folder_review_pdfs(folder_path, *, require_excel=False):
             name = None
         entries.append((path, path if name else None))
     return entries
+
+def _saved_summary_row(pdf_path):
+    """(summary path, summary row, (group, exam date) of the rename sheet) of a saved PDF, or Nones."""
+    from src.master_summary import read_rename_details, read_summary_entries
+
+    key = Path(pdf_path).stem.casefold()
+    root = Path(folder_review_location(pdf_path)["province_root"])
+    for summary in sorted(root.glob(f"{_SUMMARY_PREFIX}[0-9][0-9].xlsx")):
+        # Read a copy: an open handle would stop another machine's save from replacing the summary.
+        workbook = openpyxl.load_workbook(io.BytesIO(summary.read_bytes()), read_only=True)
+        try:
+            entry = next((e for e in read_summary_entries(workbook) if e["pdf_filename"].casefold() == key), None)
+            if entry:
+                return str(summary), entry, read_rename_details(workbook).get(key, ("", ""))
+        finally:
+            workbook.close()
+    return None, None, None
+
+
+def load_saved_dossier(pdf_path: str) -> Dict[str, Any]:
+    """A saved dossier for the review panel, read from its Excel and province summary. No OCR.
+
+    Digitized dossiers have an Excel next to the PDF (cover fields in its hidden sheet, every list
+    with its own columns); quick renames only have their summary row. The summary row gives the
+    count, GPLX numbers and status, as last written by a save or by refresh_summary_from_excel.
+    """
+    excel = os.path.splitext(pdf_path)[0] + ".xlsx"
+    summary_path, entry, details = _saved_summary_row(pdf_path)
+    has_excel = os.path.isfile(excel)
+    if entry is None and not has_excel:
+        raise ValueError(f"Không tìm thấy dữ liệu đã lưu của {os.path.basename(pdf_path)} (sổ tổng hợp, file Excel).")
+    cover, tables = {}, []
+    if has_excel:
+        try:
+            cover, _citizens = read_dossier_workbook(excel, pdf_path)
+            workbook = openpyxl.load_workbook(io.BytesIO(Path(excel).read_bytes()), read_only=True, data_only=True)
+            try:
+                tables = merge_tables(read_saved_tables(workbook))  # Excel saved before 22/11/2026: a sheet per list
+            finally:
+                workbook.close()
+        except Exception as exc:
+            logger.warning("Could not read saved Excel %s", excel, exc_info=True)
+            raise ValueError(f"Không đọc được file Excel {os.path.basename(excel)}: {exc}") from exc
+    if entry is not None:
+        group, exam_date = details
+        cover.setdefault("province_code", Path(summary_path).stem.removeprefix(_SUMMARY_PREFIX))
+        cover.setdefault("dossier_group", group)
+        cover.setdefault("exam_date", exam_date or (entry["cover_date"] if group != "QĐTT" else ""))
+        cover.update({field: entry[field] for field in (
+            "book_type", "box", "box_number", "license_class", "total_licenses", "license_sequence", "status_note",
+        ) if entry[field] not in ("", None)})
+    return {
+        "original_path": pdf_path, "tables": tables, "cover_meta": cover, "rename_only": not has_excel,
+        "saved_view": True, "excel_path": excel if has_excel else None, "summary_path": summary_path,
+    }
+
+
+def refresh_summary_from_excel(pdf_path: str) -> Dict[str, Any]:
+    """After the Excel was edited by hand: count, GPLX numbers and status of its rows go to the
+    province summary (that dossier's row only) and the lookup database. The Excel is not changed.
+    """
+    excel = os.path.splitext(pdf_path)[0] + ".xlsx"
+    name = Path(pdf_path).stem
+    if not os.path.isfile(excel):
+        raise ValueError(f"Hồ sơ {name} không có file Excel (đổi tên nhanh), nên không cập nhật từ Excel được.")
+    summary_path, entry, _details = _saved_summary_row(pdf_path)
+    if entry is None:
+        raise ValueError(f"Sổ tổng hợp chưa có dòng {name}. Hãy lưu hồ sơ trước.")
+    cover, citizens = read_dossier_workbook(excel, pdf_path)
+    counts = {"total_licenses": len(citizens), "license_sequence": cover["license_sequence"],
+              "status_note": cover["status_note"]}
+    update_summary_counts(summary_path, name, **counts)
+    db_error = None
+    try:
+        DatabaseManager().insert_or_update_dossier(
+            final_filename=name, cover_meta=cover, citizens=citizens, pdf_path=pdf_path, excel_path=excel)
+    except Exception as exc:
+        logger.exception("Could not update the database from %s", excel)
+        db_error = str(exc)
+    return {**counts, "summary_path": summary_path, "excel_path": excel, "db_error": db_error}
+
 
 def fast_extract_rename_metadata(pdf_path: str, default_province: str = "") -> str:
     """Read the header first. SQL names also need the endpoints of a unique GPLX list."""

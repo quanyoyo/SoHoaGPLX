@@ -25,12 +25,15 @@ ACTIVE_ROW_COLOR = "#DBEAFE"  # the file shown in the viewer
 
 class BatchQueueFrame(ctk.CTkFrame):
     def __init__(self, master, on_select_file_callback: Callable, on_batch_start_callback: Callable, dispatch_to_ui: Callable, on_worker_start: Callable, on_worker_finish: Callable,
-                 on_batch_stop_callback: Optional[Callable] = None, **kwargs):
+                 on_batch_stop_callback: Optional[Callable] = None, on_refresh_all_callback: Optional[Callable] = None,
+                 **kwargs):
         super().__init__(master, **kwargs)
         
         self.on_select_file_callback = on_select_file_callback
         self.on_batch_start_callback = on_batch_start_callback
         self.on_batch_stop_callback = on_batch_stop_callback
+        self.on_refresh_all_callback = on_refresh_all_callback
+        self._view = "pending"  # "pending": files to work on; "done": saved files
         self._stopping = False
         self.dispatch_to_ui = dispatch_to_ui
         self.on_worker_start = on_worker_start
@@ -125,6 +128,16 @@ class BatchQueueFrame(ctk.CTkFrame):
             command=self._start_batch
         )
         self.btn_run_batch.pack(fill="x", padx=10, pady=(0, 8))
+
+        # Saved files have their own list: opening one shows what was saved, without OCR.
+        self.view_switch = ctk.CTkSegmentedButton(self, values=self._view_labels(), command=self._on_view_switch,
+                                                  font=("Segoe UI", 11, "bold"))
+        self.view_switch.set(self._view_labels()[0])
+        self.view_switch.pack(fill="x", padx=10, pady=(0, 4))
+        self.btn_refresh_all = ctk.CTkButton(
+            self, text="🔄 Cập nhật tất cả từ Excel", font=("Segoe UI", 11, "bold"), height=28,
+            fg_color="#0F766E", hover_color="#115E59", command=self._refresh_all,
+        )
 
         # 2. File list: one table for any number of files. A card of widgets per file took 8 Windows
         # handles each: 1,300 files used up the 10,000 a program may have, 1,000 took 13 s to show.
@@ -313,7 +326,8 @@ class BatchQueueFrame(ctk.CTkFrame):
         if rename:
             self.btn_run_batch.pack_forget()
         else:
-            self.btn_run_batch.pack(fill="x", padx=10, pady=(0, 8), before=self.list_holder)
+            self.btn_run_batch.pack(fill="x", padx=10, pady=(0, 8), before=self.view_switch)
+        self._view = "pending" if any(not self._is_done(item) for item in self.queue_items) else "done"
         self._render_queue()
         self._update_batch_button()
         self.on_select_file_callback(None)
@@ -356,13 +370,33 @@ class BatchQueueFrame(ctk.CTkFrame):
         name = self._fit_name(os.path.splitext(item["filename"])[0])  # every file here is a PDF
         return self._BADGES[status][0], status, name, item is self._active
 
+    @staticmethod
+    def _is_done(item):
+        return item["status"] == "COMPLETED"
+
+    def _visible_items(self):
+        done = self._view == "done"
+        return [item for item in self.queue_items if self._is_done(item) == done]
+
+    def _view_labels(self):
+        done = sum(1 for item in self.queue_items if self._is_done(item))
+        return [f"Đang xử lý ({len(self.queue_items) - done})", f"Đã xong ({done})"]
+
+    def _on_view_switch(self, label):
+        self._view = "done" if label.startswith("Đã xong") else "pending"
+        self._render_queue()
+
+    def _refresh_all(self):
+        if self.on_refresh_all_callback:
+            self.on_refresh_all_callback([item for item in self.queue_items if self._is_done(item)])
+
     def _render_queue(self):
         """Fill the table again when the list itself changed; otherwise only update rows whose state changed."""
-        if len(self._row_items) != len(self.queue_items) or any(
-                a is not b for a, b in zip(self._row_items, self.queue_items)):
+        visible = self._visible_items()
+        if len(self._row_items) != len(visible) or any(a is not b for a, b in zip(self._row_items, visible)):
             self._rebuild_rows()
         else:
-            for item in self.queue_items:
+            for item in visible:
                 self._update_row(item)
         self._refresh_counts()
 
@@ -370,12 +404,12 @@ class BatchQueueFrame(ctk.CTkFrame):
         tree = self.file_tree
         tree.delete(*tree.get_children())
         self._rows = {}
-        self._row_items = list(self.queue_items)
+        self._row_items = self._visible_items()
         for index, item in enumerate(self._row_items):
             tree.insert("", "end", iid=str(index))
             self._rows[id(item)] = [str(index), None, item]  # the item is kept, so its id stays unique
             self._update_row(item)
-        if self._active is not None:
+        if self._active is not None and self._rows.get(id(self._active)):
             self.show_active(self._active)  # still in the list after files were added
 
     def _update_row(self, item):
@@ -416,6 +450,10 @@ class BatchQueueFrame(ctk.CTkFrame):
     def show_active(self, item):
         """Mark the file shown in the viewer, also when the app moves on to the next file itself."""
         previous, self._active = self._active, item
+        if item is not None and item in self.queue_items and self._is_done(item) != (self._view == "done"):
+            self._view = "done" if self._is_done(item) else "pending"  # the shown file is in the list on screen
+            self._render_queue()
+            return
         for changed in (previous, item):
             if changed is not None:
                 self._update_row(changed)
@@ -432,6 +470,14 @@ class BatchQueueFrame(ctk.CTkFrame):
         done_count = sum(1 for item in self.queue_items if item["status"] == "COMPLETED" or item.get("saved_pdf"))
         self.lbl_stats.configure(text=f"Đã duyệt: {done_count} / {total} file")
         self.progress_bar.set(done_count / total if total > 0 else 0)
+        labels = self._view_labels()
+        self.view_switch.configure(values=labels)
+        self.view_switch.set(labels[self._view == "done"])
+        # Only digitized files have an Excel to update the summary from.
+        if self._view == "done" and not self.rename_mode:
+            self.btn_refresh_all.pack(fill="x", padx=10, pady=(0, 4), before=self.list_holder)
+        else:
+            self.btn_refresh_all.pack_forget()
 
     def update_item_status(self, path: str, new_status: str, data: Optional[Dict[str, Any]] = None):
         if item := self.get_item(path):
@@ -442,10 +488,13 @@ class BatchQueueFrame(ctk.CTkFrame):
         if data is not None:
             item["data"] = data
         if self.get_item(item["path"]) is item:
-            if self._update_row(item):
+            in_view = self._is_done(item) == (self._view == "done")
+            if in_view and self._update_row(item):
                 self._refresh_counts()
-            else:
-                self._render_queue()
+                return
+            if not in_view and item is self._active:
+                self._view = "done" if self._is_done(item) else "pending"  # the open file stays on screen
+            self._render_queue()  # the file moved to the other list, or was not shown yet
 
     def get_item(self, path: str) -> Optional[Dict[str, Any]]:
         for item in self.queue_items:

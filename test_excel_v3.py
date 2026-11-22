@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 from src.database import DatabaseManager
 from src.excel_generator import generate_excel_companion
 from src.gui.app import GPLXApp
-from src.pipeline import commit_dossier
+from src.pipeline import commit_dossier, commit_folder_dossier, load_saved_dossier, refresh_summary_from_excel
 from src.server import lan_server
 from src.table_extractor import table_citizens
 
@@ -62,20 +62,23 @@ class ExcelV3Test(unittest.TestCase):
         generate_excel_companion(self.meta, citizens, target, source_tables=tables, pdf_path=str(pdf))
         workbook = openpyxl.load_workbook(target)
         try:
-            first_sheet, second_sheet = [sheet for sheet in workbook if sheet.sheet_state == "visible"]
-            self.assertEqual([c.value for c in first_sheet[5][:7]], [label for label, _ in columns] + ["Trang PDF"])
-            self.assertEqual([c.value for c in second_sheet[5][:3]], ["Họ và tên", "Năm sinh", "Trang PDF"])
-            self.assertEqual(first_sheet["C6"].value, "000126")
-            self.assertEqual(first_sheet["C6"].data_type, "s")
-            self.assertIsNone(first_sheet["D6"].value)
-            self.assertEqual(first_sheet["F7"].value, "=ABC")
-            self.assertEqual(first_sheet["F7"].data_type, "s")
-            self.assertEqual(first_sheet["G6"].value, 2)
-            self.assertEqual(second_sheet["C6"].value, 1)
-            self.assertEqual({(graphic.anchor._from.col, graphic.anchor._from.row) for graphic in first_sheet._images},
-                             {(1, 5), (4, 5)})
-            self.assertIn("Cần đối chiếu ảnh", first_sheet["B7"].comment.text)
-            self.assertIsNone(first_sheet["E7"].comment)
+            # The two lists are one sheet; the narrower list's own column follows the column it follows there.
+            sheet, = [sheet for sheet in workbook if sheet.sheet_state == "visible"]
+            self.assertEqual([c.value for c in sheet[5][:8]], ["Họ và tên", "Năm sinh", "Ảnh 3 x 4", "Số TT bảng kê",
+                                                              "Số giấy phép", "Ký nhận", "Ngày trả", "Trang PDF"])
+            self.assertEqual(sheet["D6"].value, "000126")
+            self.assertEqual(sheet["D6"].data_type, "s")
+            self.assertIsNone(sheet["E6"].value)
+            self.assertEqual(sheet["G7"].value, "=ABC")
+            self.assertEqual(sheet["G7"].data_type, "s")
+            self.assertEqual(sheet["H6"].value, 2)
+            self.assertEqual([c.value for c in sheet[8][:2]] + [sheet["H8"].value], ["Bùi Văn C", "1979", 1])
+            self.assertEqual({(graphic.anchor._from.col, graphic.anchor._from.row) for graphic in sheet._images},
+                             {(2, 5), (5, 5)})
+            self.assertIn("Cần đối chiếu ảnh", sheet["C7"].comment.text)
+            self.assertIsNone(sheet["F7"].comment)
+            # A list without photo or signature columns gets no note asking to check them.
+            self.assertEqual((sheet["C8"].comment, sheet["F8"].comment), (None, None))
         finally:
             workbook.close()
 
@@ -101,8 +104,9 @@ class ExcelV3Test(unittest.TestCase):
         self.assertEqual(db.search("Nguyen Van A")[0]["page_number"], 2)
 
         workbook = openpyxl.load_workbook(modern.with_suffix(".xlsx"))
-        self.assertIn("Cần đối chiếu", workbook.active["C6"].comment.text)
-        workbook.active["C6"] = "AP014543"
+        # One sheet: Số TT bảng kê | Họ và tên | Ngày cấp | Mã GPLX.
+        self.assertIn("Cần đối chiếu", workbook.active["D6"].comment.text)
+        workbook.active["D6"] = "AP014543"
         workbook.save(modern.with_suffix(".xlsx"))
         workbook.close()
         self.assertEqual(db.reindex_from_directory(self.root), 2)
@@ -274,6 +278,158 @@ class ExcelV3Test(unittest.TestCase):
         self.assertTrue(any("Số trang PDF không hợp lệ" in error for _, error in errors))
         record, = db.search("AP014542")
         self.assertEqual((Path(record["pdf_path"]), record["page_number"]), (original, 2))
+
+
+class SavedDossierTest(unittest.TestCase):
+    """A saved dossier is shown again from its Excel and summary (no OCR), and the summary can be
+    brought up to date with an Excel edited by hand."""
+
+    COLUMNS = [("STT", "stt"), ("Họ và tên", "full_name"), ("Năm sinh", "birth_year"), ("Số GPLX", "license_number")]
+
+    def setUp(self):
+        temporary = TemporaryDirectory(prefix="gplx-saved-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.folder = self.root / "Tỉnh Yên Bái" / "HOP 49" / "HO SO 116"
+        self.folder.mkdir(parents=True)
+        self.db = DatabaseManager(str(self.root / "saved.db"), files_root=str(self.root))
+        db_patch = patch("src.pipeline.DatabaseManager", return_value=self.db)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        self.meta = {"province_code": "15", "province_name": "Tỉnh Lào Cai", "book_type": "Sổ gốc GPLX",
+                     "exam_date": "22-03-1996", "box": "49", "box_number": "116", "license_class": "A1",
+                     "course": "26", "total_pages": 2, "dossier_group": "SQL", "total_licenses": 3,
+                     "license_sequence": "C244537-C244539", "status_note": "Đủ"}
+
+    def digitized(self):
+        Image.init()
+        pdf = self.folder / "scan.pdf"
+        with Image.new("RGB", (200, 200), "white") as first, Image.new("RGB", (200, 200), "white") as second:
+            first.save(pdf, save_all=True, append_images=[second], resolution=100)
+        first = table(self.COLUMNS, [row(["1", "Nguyễn Văn A", "1980", "C244537"], 1, code="C244537", state="valid"),
+                                     row(["2", "Lê Văn B", "1981", "C244538"], 1, code="C244538", state="valid")])
+        second = table([("STT", "stt"), ("Họ và tên", "full_name"), ("Số GPLX", "license_number")],
+                       [row(["1", "Hà Văn C", "C244539"], 2, code="C244539", state="valid")])
+        citizens = table_citizens(first) + table_citizens(second)
+        return commit_dossier(str(pdf), "15.SQL.03.1996.C244537-C244539", self.meta, citizens,
+                              source_tables=[first, second])
+
+    def summary_row(self, path, name):
+        workbook = openpyxl.load_workbook(path)
+        try:
+            ws = workbook.active
+            for r in range(3, ws.max_row + 1):
+                if ws.cell(r, 4).value == name:
+                    return [ws.cell(r, c).value for c in range(1, 12)]
+        finally:
+            workbook.close()
+
+    def test_a_digitized_dossier_is_read_back_without_ocr(self):
+        saved = self.digitized()
+        with patch("src.pipeline.process_dossier_pdf") as ocr:
+            data = load_saved_dossier(saved["pdf_path"])
+        ocr.assert_not_called()
+        self.assertEqual((data["rename_only"], data["saved_view"]), (False, True))
+        self.assertEqual(Path(data["excel_path"]).resolve(), Path(saved["excel_path"]).resolve())
+        # The two lists of the PDF were saved as one list, on one sheet.
+        workbook = openpyxl.load_workbook(saved["excel_path"])
+        self.assertEqual([ws.title for ws in workbook.worksheets if ws.sheet_state == "visible"], ["Danh sách GPLX"])
+        workbook.close()
+        merged, = data["tables"]
+        self.assertEqual([c["label"] for c in merged["columns"]], ["STT", "Họ và tên", "Năm sinh", "Số GPLX"])
+        self.assertEqual([r["cells"] for r in merged["rows"]], [["1", "Nguyễn Văn A", "1980", "C244537"],
+                                                               ["2", "Lê Văn B", "1981", "C244538"],
+                                                               ["1", "Hà Văn C", "", "C244539"]])
+        self.assertEqual([(r["page_number"], r["license_number"]) for r in merged["rows"]],
+                         [(1, "C244537"), (1, "C244538"), (2, "C244539")])
+        cover = data["cover_meta"]
+        self.assertEqual({k: cover[k] for k in ("province_code", "box", "box_number", "license_class", "course",
+                                                "exam_date", "total_licenses", "license_sequence", "status_note")},
+                         {"province_code": "15", "box": "49", "box_number": "116", "license_class": "A1",
+                          "course": "26", "exam_date": "22-03-1996", "total_licenses": 3,
+                          "license_sequence": "C244537-C244539", "status_note": "Đủ"})
+
+    def test_a_quick_rename_dossier_is_read_back_from_the_summary(self):
+        pdf = self.folder / "scan.pdf"
+        pdf.write_bytes(b"%PDF quick")
+        cover = {"province_code": "15", "exam_date": "15-09-2015", "decision_number": "368",
+                 "decision_date": "25-09-2015", "dossier_group": "QĐTT", "box": "49", "box_number": "116",
+                 "license_class": "B2", "course": "K7", "total_licenses": 47, "status_note": "Đủ"}
+        saved = commit_folder_dossier(str(pdf), "15.368.25.09.2015", cover)
+        data = load_saved_dossier(saved["pdf_path"])
+        self.assertEqual((data["rename_only"], data["tables"], data["excel_path"]), (True, [], None))
+        cover = data["cover_meta"]
+        self.assertEqual({k: cover[k] for k in ("province_code", "box", "box_number", "license_class",
+                                                "exam_date", "total_licenses", "status_note")},
+                         {"province_code": "15", "box": "49", "box_number": "116", "license_class": "B2",
+                          "exam_date": "15-09-2015", "total_licenses": 47, "status_note": "Đủ"})
+
+    def test_a_pdf_that_was_not_saved_or_lost_its_excel_is_reported(self):
+        pdf = self.folder / "never-saved.pdf"
+        pdf.write_bytes(b"%PDF")
+        with self.assertRaisesRegex(ValueError, "Không tìm thấy dữ liệu đã lưu"):
+            load_saved_dossier(str(pdf))
+        saved = self.digitized()
+        Path(saved["excel_path"]).write_bytes(b"not a workbook")
+        with self.assertRaisesRegex(ValueError, "Không đọc được file Excel"):
+            load_saved_dossier(saved["pdf_path"])
+
+    def edit_excel(self, path, edit):
+        workbook = openpyxl.load_workbook(path)
+        try:
+            edit(workbook)
+            workbook.save(path)
+        finally:
+            workbook.close()
+
+    def test_the_summary_follows_the_excel_edited_by_hand(self):
+        saved = self.digitized()
+        before = self.summary_row(saved["master_summary_path"], "15.SQL.03.1996.C244537-C244539")
+
+        def edit(workbook):
+            sheet = workbook["Danh sách GPLX"]
+            sheet["D7"] = "C244540"               # a corrected number breaks the sequence
+            sheet.append(["4", "Trần Văn D", "1982", "c244541", 2])  # a row added by hand, lower case
+        self.edit_excel(saved["excel_path"], edit)
+
+        result = refresh_summary_from_excel(saved["pdf_path"])
+        self.assertEqual((result["total_licenses"], result["license_sequence"], result["status_note"]),
+                         (4, "C244537; C244540; C244539; C244541", "Ngắt, không theo thứ tự"))
+        after = self.summary_row(saved["master_summary_path"], "15.SQL.03.1996.C244537-C244539")
+        self.assertEqual((after[7], after[8], after[10]), (4, "C244537; C244540; C244539; C244541", "Ngắt, không theo thứ tự"))
+        self.assertEqual(after[1:7], before[1:7], "the other columns are kept")
+        self.assertEqual(after[9], before[9])
+        self.assertEqual(self.db.search("C244541")[0]["full_name"], "Trần Văn D")
+        self.assertEqual(self.db.search("C244538"), [], "the corrected number replaces the old one")
+        dossier, = self.db.get_all_dossiers()
+        self.assertEqual((dossier["total_citizens"], dossier["license_sequence"], dossier["status_note"]),
+                         (4, "C244537; C244540; C244539; C244541", "Ngắt, không theo thứ tự"))
+        self.assertEqual(Path(saved["pdf_path"]).name, "15.SQL.03.1996.C244537-C244539.pdf", "no rename")
+
+    def test_an_excel_with_missing_numbers_needs_review(self):
+        saved = self.digitized()
+        self.edit_excel(saved["excel_path"], lambda workbook: workbook["Danh sách GPLX"].__setitem__("D7", None))
+        result = refresh_summary_from_excel(saved["pdf_path"])
+        self.assertEqual((result["total_licenses"], result["license_sequence"], result["status_note"]),
+                         (3, "C244537; C244539", "Cần rà soát"))
+
+    def test_the_excel_rescan_also_follows_the_edited_rows(self):
+        saved = self.digitized()
+        self.edit_excel(saved["excel_path"], lambda workbook: workbook["Danh sách GPLX"].__setitem__("D7", "C244540"))
+        fresh = DatabaseManager(str(self.root / "rescan.db"), files_root=str(self.root))
+        self.assertEqual(fresh.reindex_from_directory(str(self.root / "Tỉnh Yên Bái")), 1)
+        dossier, = fresh.get_all_dossiers()
+        self.assertEqual((dossier["license_sequence"], dossier["status_note"]),
+                         ("C244537; C244540; C244539", "Ngắt, không theo thứ tự"))
+
+    def test_a_quick_rename_dossier_has_no_excel_to_update_from(self):
+        pdf = self.folder / "scan.pdf"
+        pdf.write_bytes(b"%PDF quick")
+        saved = commit_folder_dossier(str(pdf), "15.368.25.09.2015",
+                                      {"province_code": "15", "exam_date": "15-09-2015", "decision_number": "368",
+                                       "decision_date": "25-09-2015", "dossier_group": "QĐTT"})
+        with self.assertRaisesRegex(ValueError, "không có file Excel"):
+            refresh_summary_from_excel(saved["pdf_path"])
 
 
 if __name__ == "__main__":

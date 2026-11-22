@@ -1,6 +1,6 @@
 # 04. Quyết định đã chốt, thay đổi cần làm và lỗi đã phát hiện
 
-Cập nhật: 22/11/2026. Các mục B*/C* ở mục 2–3 đã xử lý theo `05-ke-hoach-sua-loi.md` (C3 hoãn, B8 giữ nguyên). Mục 3.1 và 3.2 (hai lần rà soát ngày 22/11/2026): **đã sửa cùng ngày**, xem `05-ke-hoach-sua-loi.md` mục 14 và 15. Mục 3.3 và 3.4: **đã sửa** ngày 22/11/2026 (Lỗi 28 phần Hạng/Khóa chiều 22/11; Lỗi 29, 30, 31 theo `05` mục 17).
+Cập nhật: 22/11/2026. Các mục B*/C* ở mục 2–3 đã xử lý theo `05-ke-hoach-sua-loi.md` (C3 hoãn, B8 giữ nguyên). Mục 3.1 và 3.2 (hai lần rà soát ngày 22/11/2026): **đã sửa cùng ngày**, xem `05-ke-hoach-sua-loi.md` mục 14 và 15. Mục 3.3 và 3.4: **đã sửa** ngày 22/11/2026 (Lỗi 28 phần Hạng/Khóa chiều 22/11; Lỗi 29, 30, 31 theo `05` mục 17). Gộp danh sách thành một cho mỗi PDF, 1 sheet Excel, ghép cột theo vị trí in trên giấy: **đã làm**, xem `05` mục 21.
 
 ## 1. Quyết định đã chốt với chủ dự án
 
@@ -15,7 +15,7 @@ Cập nhật: 22/11/2026. Các mục B*/C* ở mục 2–3 đã xử lý theo `0
 | D7 | Đổi tên | **Đổi tên hẳn, không giữ file gốc** |
 | D8 | Luồng xử lý | Cả luồng A và luồng B đều là luồng chính |
 | D9 | Luồng B và CSDL | Luồng B **ghi CSDL, chỉ thông tin hồ sơ** (bảng `dossiers`), không có danh sách công dân |
-| D10 | Excel con | Giữ định dạng hiện tại của code (`GPLX/3`, giữ cột nguồn) |
+| D10 | Excel con | Gộp toàn bộ thành 1 sheet "Danh sách GPLX" duy nhất cho mỗi PDF (ghép cột theo vị trí in trên giấy; `GPLX/3`). Excel cũ nhiều sheet vẫn đọc được và tự động gộp |
 | D11 | CSDL | Giữ cấu trúc hiện tại của code |
 | D12 | Mạng | ~~1 máy chủ chạy app; máy khác tra cứu qua trình duyệt~~ → **Máy chủ chia sẻ thư mục `So Hoa GPLX`; máy con mở app từ thư mục chia sẻ, OCR trên máy con, dùng chung PDF/Excel/CSDL** (21/11/2026). Kế hoạch: `05-ke-hoach-sua-loi.md` |
 | D13 | Tài liệu cũ | Không chính xác; dựa vào code và `docs/`. Giữ nguyên file cũ |
@@ -109,11 +109,18 @@ Tài liệu chưa khớp code: **đã sửa tài liệu ngày 22/11/2026** (`01`
 - `02` luồng A ghi việc khôi phục cột "phát hiện cột đầu chứa chuỗi số thứ tự tăng dần". Code chỉ cần ≥ 50% ô cột đầu là số 1–4 chữ số, không kiểm tra tăng dần.
 - `01` mục 5 ghi "Repo chưa có `requirements.txt`". File này đã có từ 21/11.
 
+### 3.5. Rà soát 22/11/2026 (lần 5) — chưa sửa
+
+| # | Mức | Lỗi, số đo / cách tái hiện | Vị trí |
+|---|---|---|---|
+| Lỗi 33 (đã sửa 22/11/2026, `05` mục 20) | Thấp | Từ khi ghi chú đặt tên chỉ hiện lỗi (`05` mục 17, đã có trong commit b443c83): không có lỗi nào thì khung ghi chú (`naming_notes_frame`, CTkFrame rỗng) vẫn giữ chiều cao mặc định 200 (đo trên cửa sổ thật Scale 200%: cao 400 điểm ảnh, 0 dòng chữ), để lại một mảng trống lớn dưới ô tên file, đẩy các thẻ xuống. | `src/gui/review_panel.py`: `naming_notes_frame`, `_render_naming_lines` |
+| Lỗi 32 | Thấp | Cột hàng đợi kéo về độ rộng tối thiểu 180: chữ nút "📑 Đổi tên file nhanh (chọn theo folder)" cần 415 điểm ảnh nhưng nút chỉ rộng 320 (Scale 200%), bị cắt. Có từ trước, phát hiện khi đo nút mới "🔄 Cập nhật tất cả từ Excel" (nút mới đã rút gọn chữ, cần 286). | `src/gui/batch_queue.py`: `btn_rename_folder` |
+
 ## 4. Môi trường và giới hạn
 
 - Đã tạo `.venv` (Python 3.14) ngày 21/11/2026. Chạy test: `.venv\Scripts\python.exe -m unittest test_folder_review_v3 test_master_summary_format ...`.
 - Đã cài đủ thư viện, gồm `rapidocr_onnxruntime` 1.2.3 (onnxruntime 1.32) và `httpx2` (cho FastAPI TestClient).
-- Ngày 22/11/2026: 125 test, tất cả đạt, 1 bỏ qua. `test_phase6...test_11` cần `So Hoa GPLX.zip` đã build (đã có).
+- Ngày 22/11/2026: 173 test, tất cả đạt, 1 bỏ qua (sau `05` mục 21). `test_phase6...test_11` cần `So Hoa GPLX.zip` đã build (đã có).
 - Trang PDF mẫu render được bằng `pypdfium2`.
 - Không chạy `test_phase2.py` cùng bộ test: nó OCR thật và ghi vào `samples/`.
 - File mẫu `HO SO 113/H38.8.4_QD_000703_…` đã bị đổi tên thật thành `15.SQL.06.2010.AP014542-AP014618.pdf` khi chạy thử chiều 22/11; sổ tổng hợp tỉnh trong thư mục mẫu cũng đã được ghi.

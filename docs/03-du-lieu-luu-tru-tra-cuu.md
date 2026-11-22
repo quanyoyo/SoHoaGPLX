@@ -44,7 +44,7 @@ app vẫn dùng tên `So_Theo_Doi_Day_So_GPLX_<mã tỉnh>.xlsx`). Khi chưa có
 | 6 | HỘP SỐ | như HỘP |
 | 7 | Hạng | `license_class` |
 | 8 | Tổng số lượng GPLX | số dòng danh sách |
-| 9 | Số GPLX trong file | dãy số, vd `A161541; C244138-C244248` |
+| 9 | Số GPLX trong file | dãy số, vd `A161541; C244138-C244248`. Máy tính từ danh sách khi lưu; "Cập nhật sổ tổng hợp từ Excel" tính lại từ Excel (chỉ các số hợp lệ; còn ô trống/sai dạng thì cột 11 là `Cần rà soát`) |
 | 10 | Tổng số trang PDF | |
 | 11 | Ghi chú / nhận định | `Đủ` / `Ngắt, không theo thứ tự` / `Cần rà soát` |
 | 12 | Ngày cập nhật | ngày giờ ghi, hiển thị `dd/mm/yyyy hh:mm` |
@@ -98,7 +98,7 @@ SELECT * FROM dossiers WHERE province_code = '15' AND box = '49' AND box_number 
 Trong app:
 - **Tab Tra cứu → "👤 Tra Cứu Công Dân"**: 1 ô tìm kiếm khớp *một trong* số GPLX (chứa chuỗi), họ tên có/không dấu (chứa chuỗi), năm sinh (bằng); lọc theo tỉnh; tối đa 200 kết quả (`RESULT_LIMIT`), nhiều hơn thì ghi "Hiện 200/N kết quả đầu". Nút xem PDF đúng trang, mở Excel, mở thư mục.
 - **"📁 Danh Mục Sổ / File Excel Đã Import"**: lọc theo tỉnh, hộp, từ khóa (tên file/hộp/hộp số); thống kê số tỉnh/hộp/hộp số/file; xem toàn bộ công dân của một sổ.
-- **"🔄 Quét lại từ Excel"**: quét thư mục, mỗi cặp `X.pdf` + `X.xlsx` (bỏ qua `So_Theo_Doi_*`, `~$*`, `.gplx-*`) được nạp lại vào CSDL — dùng khi sửa Excel bằng tay. Sau đó đọc các sổ `So_Theo_Doi_Day_So_GPLX_<mã>.xlsx`: hồ sơ có trong sổ mà chưa có Excel (đổi tên nhanh) được tạo lại từ dòng sổ (mã tỉnh lấy từ tên sổ; PDF tìm theo `_GPLX_Rename`, không có thì tìm theo tên file trong thư mục tỉnh). Dòng sổ không còn PDF thì bỏ qua và ghi log (B9b). Trước khi nạp, các dòng CSDL có PDF nằm trong thư mục được quét mà file không còn (đã đổi tên/xóa, hoặc lưu với tên mới nhưng ghi CSDL lỗi) bị bỏ và liệt kê trong thông báo kết quả. Excel con và sổ tổng hợp được đọc từ bản sao trong bộ nhớ để máy khác vẫn lưu được trong lúc quét.
+- **"🔄 Quét lại từ Excel"**: quét thư mục, mỗi cặp `X.pdf` + `X.xlsx` (bỏ qua `So_Theo_Doi_*`, `~$*`, `.gplx-*`) được nạp lại vào CSDL — dùng khi sửa Excel bằng tay. Dãy số và nhận định được tính lại từ các dòng Excel (như "Cập nhật sổ tổng hợp từ Excel"), không lấy giá trị lúc lưu ở sheet ẩn `_GPLX`; nút này không ghi sổ tổng hợp. Sau đó đọc các sổ `So_Theo_Doi_Day_So_GPLX_<mã>.xlsx`: hồ sơ có trong sổ mà chưa có Excel (đổi tên nhanh) được tạo lại từ dòng sổ (mã tỉnh lấy từ tên sổ; PDF tìm theo `_GPLX_Rename`, không có thì tìm theo tên file trong thư mục tỉnh). Dòng sổ không còn PDF thì bỏ qua và ghi log (B9b). Trước khi nạp, các dòng CSDL có PDF nằm trong thư mục được quét mà file không còn (đã đổi tên/xóa, hoặc lưu với tên mới nhưng ghi CSDL lỗi) bị bỏ và liệt kê trong thông báo kết quả. Excel con và sổ tổng hợp được đọc từ bản sao trong bộ nhớ để máy khác vẫn lưu được trong lúc quét.
 
 ## 4. Tra cứu qua mạng (LAN/WAN)
 

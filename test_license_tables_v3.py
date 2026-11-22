@@ -264,6 +264,126 @@ class LicenseTablesV3Test(unittest.TestCase):
             self.assertEqual(fast_extract_rename_metadata("example.pdf", "15"), "15.SQL.06.2010.A465211-B295726")
 
 
+def plain_list(columns, rows, page, unresolved=None):
+    table = {"columns": [{"label": label, "role": role} for label, role in columns], "rows": [
+        {"cells": list(cells), "scores": [.9] * len(cells), "bounds": [(0, 0, 1, 1)] * len(cells), "page_number": page,
+         "stt": None, "identity_confident": True, "license_number": cells[-1] if cells[-1].startswith("C") else "",
+         "license_state": "valid"} for cells in rows]}
+    if unresolved:
+        table["unresolved_pages"] = unresolved
+    return table
+
+
+class MergeListsTest(unittest.TestCase):
+    """The lists of one PDF are one dossier: shown, summarized and saved as one list (one Excel sheet)."""
+
+    def test_lists_become_one_list_with_every_column(self):
+        from src.table_extractor import merge_tables
+        first = plain_list([("STT", "stt"), ("Họ và tên", "full_name"), ("Năm sinh", "birth_year"), ("Số GPLX", "license_number")],
+                           [("1", "Nguyễn Văn A", "1980", "C244537"), ("2", "Lê Văn B", "1981", "C244538")], 2, unresolved=[3])
+        second = plain_list([("STT", "stt"), ("HO VA TEN", "full_name"), ("ANH 3 X 4", "photo"), ("Năm sinh", "birth_year"),
+                             ("Số GPLX", "license_number"), ("Ký nhận", "signature")],
+                            [("1", "Hà Văn C", "ảnh", "1982", "C244539", "ký")], 5)
+        merged, = merge_tables([first, {"columns": [], "rows": []}, second])
+        self.assertEqual([(c["label"], c["role"]) for c in merged["columns"]], [
+            ("STT", "stt"), ("Họ và tên", "full_name"), ("ANH 3 X 4", "photo"), ("Năm sinh", "birth_year"),
+            ("Số GPLX", "license_number"), ("Ký nhận", "signature")])
+        self.assertEqual([r["cells"] for r in merged["rows"]], [
+            ["1", "Nguyễn Văn A", "", "1980", "C244537", ""], ["2", "Lê Văn B", "", "1981", "C244538", ""],
+            ["1", "Hà Văn C", "ảnh", "1982", "C244539", "ký"]])
+        self.assertEqual([len(r["scores"]) for r in merged["rows"]], [6, 6, 6])
+        self.assertEqual(merged["rows"][0]["bounds"][2], None, "no photo cell in that list")
+        self.assertEqual([r.get("absent_columns", []) for r in merged["rows"]], [[2, 5], [2, 5], []])
+        self.assertEqual([r["page_number"] for r in merged["rows"]], [2, 2, 5])
+        self.assertEqual(merged["unresolved_pages"], [3])
+        self.assertEqual(len(first["rows"][0]["cells"]), 4, "the lists read are not changed")
+        self.assertEqual(merge_tables([first])[0]["columns"], first["columns"])
+        self.assertEqual(merge_tables([]), [])
+
+    def test_the_same_printed_column_is_one_column_whatever_its_heading_was_read_as(self):
+        from src.table_extractor import merge_tables
+
+        def placed(columns, rows, page):
+            table = plain_list([(label, role) for label, role, _, _ in columns], rows, page)
+            for column, (_, _, left, right) in zip(table["columns"], columns):
+                column.update(left=left, right=right)
+            return table
+        # The headings of one book as OCR read them on two pages (sample 4_SG_000116_..._000006).
+        first = placed([("STT", "stt", .05, .09), ("HO VA TEN", "full_name", .09, .30), ("ANH 3 X 4", "photo", .30, .42),
+                        ("Quốc tịch", "nationality", .42, .52), ("Số bằng", "license_number", .52, .70),
+                        ("Ký nhận", "signature", .70, .95)],
+                       [("1", "Nguyễn Văn A", "", "Viet Nam", "C244537", "")], 2)
+        second = placed([("STT", "stt", .06, .10), ("HO VA TEN", "full_name", .10, .31), ("ANH 3", "other", .31, .37),
+                         ("X4", "other", .37, .43), ("QUOC", "other", .43, .47), ("TICH", "other", .47, .53),
+                         ("BANG", "license_number", .53, .71), ("KY", "other", .71, .82), ("NHAN", "other", .82, .96)],
+                        [("1", "Lê Văn B", "", "", "Viet", "Nam", "C244538", "", "")], 3)
+        merged, = merge_tables([first, second])
+        self.assertEqual([(c["label"], c["role"]) for c in merged["columns"]], [
+            ("STT", "stt"), ("HO VA TEN", "full_name"), ("ANH 3 X 4", "photo"), ("Quốc tịch", "nationality"),
+            ("Số bằng", "license_number"), ("Ký nhận", "signature")])
+        self.assertEqual(merged["rows"][1]["cells"], ["1", "Lê Văn B", "", "Viet Nam", "C244538", ""])
+        self.assertNotIn("absent_columns", merged["rows"][1])
+        # A heading read only as text on the first page takes the role read on another page.
+        first["columns"][3].update(label="QUOC TICH!", role="other")
+        merged, = merge_tables([first, second])
+        self.assertEqual([c["role"] for c in merged["columns"]][3], "other")
+        merged, = merge_tables([second, first])
+        self.assertEqual((merged["columns"][3]["label"], merged["columns"][3]["role"]), ("QUOC TICH!", "other"))
+        # A column wider than the frame's (its heading split differently) joins it; so does the one GPLX column
+        # wherever it was read (sample 4_SG_000116_..._000007: numbers under the "NHAN" heading).
+        fourth = placed([("STT", "stt", .05, .09), ("HO VA TEN", "full_name", .09, .30), ("ANH", "photo", .28, .48),
+                         ("NHAN", "license_number", .72, .95)], [("1", "Đỗ Văn D", "", "C244540")], 5)
+        merged, = merge_tables([first, fourth])
+        self.assertEqual(len(merged["columns"]), 6)
+        self.assertEqual(merged["rows"][1]["cells"], ["1", "Đỗ Văn D", "", "", "C244540", ""])
+        # A heading split in two on the frame page: the photo column of another page joins the photo half.
+        split = placed([("STT", "stt", .05, .09), ("HO VA TEN", "full_name", .09, .30), ("ANH", "photo", .30, .36),
+                        ("X4", "other", .36, .42), ("Quốc tịch", "nationality", .42, .52), ("Số bằng", "license_number", .52, .70),
+                        ("Ký nhận", "signature", .70, .95)], [("1", "Ngô Văn E", "", "", "Viet Nam", "C244541", "")], 6)
+        merged, = merge_tables([split, fourth])
+        self.assertEqual([c["role"] for c in merged["columns"]].count("photo"), 1)
+        self.assertEqual([c["label"] for c in merged["columns"]][2:4], ["ANH", "X4"])
+        # A column at a different place is its own column, in page order.
+        third = placed([("STT", "stt", .05, .09), ("HO VA TEN", "full_name", .09, .30), ("Năm sinh", "birth_year", .30, .40),
+                        ("Số bằng", "license_number", .52, .70)], [("1", "Hà Văn C", "1982", "C244539")], 4)
+        merged, = merge_tables([first, third])
+        self.assertEqual([c["role"] for c in merged["columns"]],
+                         ["stt", "full_name", "photo", "birth_year", "other", "license_number", "signature"])
+
+    def test_a_page_to_check_inside_the_book_keeps_the_last_number(self):
+        from src.table_extractor import merge_tables
+        columns = [("STT", "stt"), ("Họ và tên", "full_name"), ("Số GPLX", "license_number")]
+        merged = merge_tables([plain_list(columns, [("1", "A", "C244537")], 2, unresolved=[3]),
+                               plain_list(columns, [("1", "B", "C244538")], 4)])
+        stats = summarize_license_table(merged[0])
+        self.assertEqual((stats["first_license_no"], stats["last_license_no"], stats["status_note"]),
+                         ("C244537", "C244538", "Cần rà soát"))
+        # A page to check after the last row: the list may go on there, so its end is not known.
+        stats = summarize_license_table(plain_list(columns, [("1", "A", "C244537")], 2, unresolved=[3]))
+        self.assertEqual(stats["last_license_no"], "")
+
+    def test_the_review_gets_the_lists_of_a_pdf_as_one(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path as P
+        from src.pipeline import process_dossier_pdf
+        extractor = LicenseTableExtractor()
+        ocr, grid = make_page((50, HEADERS, [row(1, "A465211")]), (350, HEADERS, [row(1, "A465212")]))
+        extractor.read_page(ocr, SIZE, grid, 1)
+        self.assertEqual(len(extractor.tables), 2)
+        cover = dict(document_type="cover", exam_date="01/06/2010", province_code="15", decision_date="",
+                     decision_number="", metadata_review={})
+        with TemporaryDirectory() as folder:
+            pdf = P(folder, "scan.pdf")
+            pdf.write_bytes(b"%PDF")
+            with (patch("src.pipeline._pdf_cache_key", return_value=(str(pdf), 5, 5)),
+                  patch("src.pipeline._cached_opening", return_value=(cover, 1, None)),
+                  patch("src.pipeline._cached_tables", return_value=extractor.tables)):
+                data = process_dossier_pdf(str(pdf), "15")
+        table, = data["tables"]
+        self.assertEqual([r["license_number"] for r in table["rows"]], ["A465211", "A465212"])
+        self.assertEqual(data["proposed_filename"], "15.SQL.06.2010.A465211-A465212")
+
+
 class LookupFieldsTest(unittest.TestCase):
     def test_names_are_stored_as_read_without_guessing_accents(self):
         from src.vietnamese_utils import clean_vietnamese_name
@@ -480,6 +600,171 @@ class WholeBookSummaryTest(unittest.TestCase):
         whole, single = summarize_license_tables([table]), summarize_license_table(table)
         self.assertEqual(whole, single)
         self.assertEqual(whole["table_review"], "Có dòng chưa đọc rõ họ tên. Hãy đối chiếu số lượng GPLX.")
+
+
+WIDE = ("STT", "Họ và tên", "Năm sinh", "Nơi đăng ký hộ khẩu", "Quốc tịch", "Số giấy phép", "Hạng GPLX")
+WIDE_EDGES = (25, 70, 230, 300, 520, 620, 780, 875)
+
+
+def wide_page(records):
+    """A typed list: each record is a list of OCR boxes (text, [(x0, x1) of each piece of ink]).
+
+    One box may cover ink on both sides of a printed rule, as OCR reads a line across a cell border.
+    """
+    image = Image.new("L", SIZE, 255)
+    draw = ImageDraw.Draw(image)
+    start, step = 60, 38
+    end = start + step * (len(records) + 1)
+    for x in WIDE_EDGES:
+        draw.line((x, start, x, end), fill=0, width=1)
+    for i in range(len(records) + 2):
+        draw.line((WIDE_EDGES[0], start + i * step, WIDE_EDGES[-1], start + i * step), fill=0, width=1)
+    result = []
+    lines = [[(label, [(WIDE_EDGES[c] + 6, WIDE_EDGES[c] + 6 + min(len(label) * 7, WIDE_EDGES[c + 1] - WIDE_EDGES[c] - 10))])
+              for c, label in enumerate(WIDE)]] + records
+    for i, boxes in enumerate(lines):
+        y = start + i * step + 11
+        for text, pieces in boxes:
+            for x0, x1 in pieces:
+                draw.rectangle((x0, y + 2, x1, y + 13), fill=0)  # the printed words
+            x0, x1 = pieces[0][0], pieces[-1][1]
+            result.append(([(x0, y), (x1, y), (x1, y + 16), (x0, y + 16)], text, .95))
+    return result, measure_page_grid(image)
+
+
+def cell(column, text):
+    """A box inside one column."""
+    x0 = WIDE_EDGES[column] + 6
+    return text, [(x0, x0 + min(len(text) * 7, WIDE_EDGES[column + 1] - x0 - 4))]
+
+
+class ShiftedCellsTest(unittest.TestCase):
+    """Typed lists where OCR read one line across several cells (Năm sinh | Nơi ĐKHK, Quốc tịch | Số giấy phép | Hạng)."""
+
+    def test_a_box_across_printed_rules_is_cut_at_the_rules(self):
+        ocr, grid = wide_page([
+            [cell(0, "1"), cell(1, "Hoàng Văn An"),
+             ("1974 Xa Thinh Hung - Yen Binh", [(240, 270), (306, 330), (336, 440)]),
+             ("Lao Cai ZZ", [(450, 500), (528, 548)])],
+            [cell(0, "2"), cell(1, "Lê Thị Bình"), cell(2, "1980"), cell(3, "Xa Tan Nguyen"),
+             ("Viet Nam AG982436 A1", [(528, 590), (628, 690), (788, 802)])],
+        ])
+        extractor = LicenseTableExtractor()
+        extractor.read_page(ocr, SIZE, grid, 1)
+        table, = extractor.tables
+        self.assertEqual([c["role"] for c in table["columns"]],
+                         ["stt", "full_name", "birth_year", "address", "nationality", "license_number", "license_class"])
+        first, second = (r["cells"] for r in table["rows"])
+        self.assertEqual(first[2:5], ["1974", "Xa Thinh Hung - Yen Binh Lao Cai", "ZZ"])
+        self.assertEqual(second[4:], ["Viet Nam", "AG982436", "A1"])
+        self.assertEqual((table["rows"][1]["license_number"], table["rows"][1]["license_state"]), ("AG982436", "valid"))
+
+    def test_a_box_reaching_over_a_rule_without_ink_there_is_kept_whole(self):
+        # The OCR box is wider than the words; only ink decides where the text is.
+        ocr, grid = wide_page([[cell(0, "1"), ("Nguyễn Văn Thành Long", [(76, 226)]), cell(2, "1980"),
+                                cell(3, "Xa Tan Nguyen"), cell(5, "AG982436")],
+                               [cell(0, "2"), cell(1, "Lê Văn Bình"), cell(2, "1981"), cell(3, "Xa Tan Nguyen"),
+                                cell(5, "AG982437")]])
+        ocr[-9] = ([(76, 109), (300, 109), (300, 125), (76, 125)], "Nguyễn Văn Thành Long", .95)
+        extractor = LicenseTableExtractor()
+        extractor.read_page(ocr, SIZE, grid, 1)
+        self.assertEqual(extractor.tables[0]["rows"][0]["cells"][1:3], ["Nguyễn Văn Thành Long", "1980"])
+
+    COLUMNS = [{"label": label, "role": role, "left": i / 7, "right": (i + 1) / 7} for i, (label, role) in enumerate((
+        ("STT", "stt"), ("Họ và tên", "full_name"), ("Năm sinh", "birth_year"), ("Nơi ĐKHK", "address"),
+        ("Quốc tịch", "nationality"), ("Số giấy phép", "license_number"), ("Hạng GPLX", "license_class")))]
+
+    def repair(self, *cells):
+        from types import SimpleNamespace
+        from src.table_extractor import _finish_rows
+        rows = [ocr_row(c) for c in cells]
+        _finish_rows(rows, [dict(c) for c in self.COLUMNS], SimpleNamespace(is_blank=lambda bounds: False))
+        return rows
+
+    def test_cells_shifted_into_the_next_column_go_back_by_what_they_hold(self):
+        # Rows of the screenshot of 22/11/2026: the edges between columns did not match the printed cells.
+        rows = self.repair(
+            ["1", "Hoàng Văn A", "Bai", "1974 Xa ThinhHung -Huyen Yen Binh -Tinh Yen", "", "Viet Nam AG982435 Al", ""],
+            ["2", "Lê Văn B", "Bai", "1985XaTanNguyen-Huyen Yen Binh -Tinh", "Viet Nam", "AG982436 A1", ""],
+            ["5", "Hà Văn E", "1988 Bai", "Xa Yen Binh-Huyen Yen Binh -Tinh Yen", "", "Viet Nam AG982439 A1", ""],
+            ["9", "Lò Văn I", "", "1985XaDeXuPhinh- Huyen Mu Cang Cha", "Viet Nam :", "AG983278A1", ""],
+        )
+        self.assertEqual([r["cells"][2:] for r in rows], [
+            ["1974", "Xa ThinhHung -Huyen Yen Binh -Tinh Yen Bai", "Viet Nam", "AG982435", "A1"],
+            ["1985", "XaTanNguyen-Huyen Yen Binh -Tinh Bai", "Viet Nam", "AG982436", "A1"],
+            ["1988", "Xa Yen Binh-Huyen Yen Binh -Tinh Yen Bai", "Viet Nam", "AG982439", "A1"],
+            ["1985", "XaDeXuPhinh- Huyen Mu Cang Cha", "Viet Nam", "AG983278", "A1"],
+        ])
+        self.assertEqual([r["license_state"] for r in rows], ["valid"] * 4)
+
+    def test_cells_already_in_place_are_not_moved(self):
+        rows = self.repair(
+            ["1", "Hoàng Văn A", "1974", "1975 Hoang Hoa Tham - TP Yen Bai", "Viet Nam", "AB123456", "B2"],
+            ["2", "Lê Văn B", "12/03/1980", "Xa Tan Nguyen", "Lào", "AG982436", ""],
+            ["3", "Hà Văn C", "1981", "Xa Tan Nguyen", "", "A&9826", ""],
+        )
+        self.assertEqual([r["cells"][2:] for r in rows], [
+            ["1974", "1975 Hoang Hoa Tham - TP Yen Bai", "Viet Nam", "AB123456", "B2"],
+            ["12/03/1980", "Xa Tan Nguyen", "Lào", "AG982436", ""],
+            ["1981", "Xa Tan Nguyen", "", "A&9826", ""],
+        ])
+
+
+def numbered(*cells):
+    """A list of rows with only a GPLX column, as read: valid numbers and unclear ones."""
+    from src.table_extractor import _license
+    rows = []
+    for text in cells:
+        state, text = (text, "") if text in ("blank",) else ("valid" if _license(text) else "uncertain", text)
+        rows.append({"cells": [text], "license_number": _license(text) if state == "valid" else "",
+                     "license_state": state, "page_number": 1, "stt": None, "identity_confident": True})
+    return {"columns": [{"label": "Số GPLX", "role": "license_number"}], "rows": rows}
+
+
+class LicenseSuggestionTest(unittest.TestCase):
+    """GPLX numbers of one list are usually consecutive: a number the neighbours fix is suggested."""
+
+    def suggest(self, *cells, edited=()):
+        from src.table_extractor import suggest_license_numbers
+        table = numbered(*cells)
+        for index in edited:
+            table["rows"][index]["_edited"] = True
+        return suggest_license_numbers(table)
+
+    def test_numbers_read_wrong_between_consecutive_neighbours(self):
+        self.assertEqual(self.suggest("AG982435", "AG98240", "AG982437", "4G982438", "AG982439", "AG982413",
+                                      "AG982441", "AG982442", "A98244y"),
+                         {1: "AG982436", 3: "AG982438", 5: "AG982440", 8: "AG982443"})
+
+    def test_two_unclear_numbers_in_a_row_and_a_gap_that_does_not_fit(self):
+        self.assertEqual(self.suggest("C244537", "C2445??", "C24453?", "C244540"), {1: "C244538", 2: "C244539"})
+        self.assertEqual(self.suggest("C244537", "C2445??", "C24453?", "C244545"), {}, "the count does not fit")
+
+    def test_numbers_next_to_a_break_follow_their_own_side(self):
+        # Two lists of one PDF shown as one (sample 15.SQL.03.1996.C244337-C244498, pages 26 and 28).
+        self.assertEqual(self.suggest("C244433", "C244434", "C244435 --", "C244436 --", "C244441", "C244442"),
+                         {2: "C244435", 3: "C244436"})
+        # Both sides fit as well: nothing is guessed. Else the closer one is suggested.
+        self.assertEqual(self.suggest("C244433", "C244434", "C24443?", "C244437", "C244438"), {})
+        self.assertEqual(self.suggest("C244433", "C244434", "C24443?", "C244445", "C244446"), {2: "C244435"})
+
+    def test_a_number_read_clearly_is_not_replaced_from_one_side(self):
+        from src.table_extractor import suggest_license_numbers
+        # Sample 15.SQL.03.1996.C244337-C244498 p37-39: a list whose GPLX column was not found, and one
+        # row holding two people's numbers, so counting rows is one off. The numbers read stay.
+        table = numbered("C244476", "C244477", "C244335", "C244481", "C244482 C244483", "C244484", "C244485", "C244486")
+        for row in table["rows"][3:6]:
+            row.update(license_state="unknown_column", license_number="")
+        self.assertEqual(suggest_license_numbers(table), {5: "C244484"})
+
+    def test_real_breaks_blanks_and_checked_cells_are_left(self):
+        self.assertEqual(self.suggest("C244537", "C244538", "C244600", "C244601"), {})
+        self.assertEqual(self.suggest("C244537", "blank", "C244539"), {})
+        self.assertEqual(self.suggest("C244537", "C24453B", "C244539", edited=(1,)), {})
+        # One known number is not a sequence to follow.
+        self.assertEqual(self.suggest("C244537", "C24453B"), {})
+        # A number unlike the expected one at the end of a list is not guessed.
+        self.assertEqual(self.suggest("C244537", "C244538", "Z1"), {})
 
 
 if __name__ == "__main__":

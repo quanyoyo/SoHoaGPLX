@@ -156,6 +156,123 @@ def _split_merged(box):
     return [box]
 
 
+def _break_points(text):
+    """Where a line may be cut: at a space, or between a number and a word written without one."""
+    points = []
+    for i in range(1, len(text)):
+        a, b = text[i - 1], text[i]
+        if b == " " and a != " ":
+            points.append(i)
+        elif a.isalnum() and b.isalnum() and a.isdigit() != b.isdigit():
+            points.append(i)
+    return points
+
+
+def _fits_column(text, role):
+    """Whether a piece cut from a box can be the value of a column of that role."""
+    words = re.search(r"[A-Za-zÀ-ỹ]{2}", text)
+    if role == "stt":
+        return bool(re.fullmatch(r"[0-9]{1,4}[.)]?", text))
+    if role == "register_index":
+        return bool(re.fullmatch(r"[0-9]{4,12}", text))
+    if role in ("birth_year", "issue_date"):
+        return bool(re.search(r"[0-9]{4}|[0-9]{1,2}[/.\-][0-9]{1,2}", text)) and not words
+    if role == "license_number":
+        return bool(re.search(r"[0-9]{3}", text)) and not re.search(r"[A-Za-zÀ-ỹ]{3}", text) and text.count(" ") <= 1
+    if role == "license_class":
+        return bool(re.fullmatch(r"[A-F][0-9lI|A-F]?[0-9]?", text))
+    if role == "nationality":
+        return bool(re.fullmatch(r"[A-Za-zÀ-ỹ .]{2,24}", text))
+    if role == "full_name":
+        return bool(words) and not re.search(r"[0-9]{2}", text)
+    return True
+
+
+def _cut_at_rules(box, columns, grid, others=()):
+    """OCR reads a typed line across the printed cell borders as one box ("Viet Nam AG982436 A1").
+
+    The box is cut where a printed rule runs between two of its words. Where in the text a cut
+    falls is measured on the ink: each cell's share of the box's ink, which leaves out the white
+    space around the rules. A box with no ink past a rule is the width OCR gave it, not text in the
+    next cell, and is kept whole there; ink under another box of the line (OCR boxes are often wider
+    than their words) is not counted. A cut is made only at a space or a number/word change near
+    that point, and only when each piece can be the value of its column (an STT is 1-4 digits, a
+    birth year has no words...); otherwise the box is kept whole as before.
+    """
+    ink = getattr(grid, "ink", None)
+    if ink is None or len(box.text) < 2:
+        return [box]
+    rules = []
+    for column in columns[:-1]:
+        edge = column["right"]
+        if box.x0 < edge < box.x1:
+            rule = min((x for x, start, end in grid.vertical
+                        if abs(x - edge) <= .006 and start - .01 <= box.y <= end + .01),
+                       key=lambda x: abs(x - edge), default=None)
+            if rule is not None:
+                rules.append(rule)
+    if not rules:
+        return [box]
+    height, width = ink.shape
+    inset = (box.y1 - box.y0) * height * .2
+    top = int(box.y0 * height + inset)
+    left_px = int(box.x0 * width)
+    crop = ink[top:max(int(box.y1 * height - inset), top + 1), left_px:int(box.x1 * width) + 1]
+    if not crop.size:
+        return [box]
+    columns_inked = crop.max(axis=0) > 0
+    for other in others:
+        a, b = max(int(other.x0 * width) - left_px, 0), min(int(other.x1 * width) + 1 - left_px, crop.shape[1])
+        if a < b:
+            columns_inked[a:b] = False
+    inked = np.flatnonzero(columns_inked)
+    margin = max(3, round(width * .004))
+
+    def extent(a, b):
+        found = inked[(inked > a + margin) & (inked < b - margin)]
+        return found[-1] - found[0] + 1 if len(found) else 0
+
+    # Rules with no ink beyond them do not cut: the cell before them runs on to the next rule.
+    bounds = [-margin - 1, *(round(rule * width) - left_px for rule in sorted(rules)), crop.shape[1] + margin + 1]
+    kept = [bounds[0]]
+    for i, at in enumerate(bounds[1:-1], start=1):
+        if extent(kept[-1], at) and extent(at, bounds[i + 1]):
+            kept.append(at)
+    kept.append(bounds[-1])
+    widths = [extent(a, b) for a, b in zip(kept, kept[1:])]
+    if len(widths) < 2 or not all(widths):
+        return [box]
+
+    def role_at(a, b):
+        x = (max(a, 0) + min(b, crop.shape[1])) / 2 / width + box.x0
+        return next((c["role"] for c in columns if c["left"] <= x < c["right"]), "other")
+
+    def piece(text, role):
+        text = text.strip(" :;,|/").strip()
+        text = re.sub(r"^[(.\-)]+\s*", "", text) if role != "address" else text
+        return _clean_name(text) if role == "full_name" else text
+
+    total, done, last, texts = sum(widths), 0, 0, []
+    points = _break_points(box.text)
+    for k, w in enumerate(widths[:-1]):
+        done += w
+        position = done / total * len(box.text)
+        role = role_at(kept[k], kept[k + 1])
+        near = sorted((i for i in points if i > last and abs(i - position) <= max(2.0, len(box.text) * .2)),
+                      key=lambda i: abs(i - position))
+        cut = next((i for i in near if piece(box.text[last:i], role) and _fits_column(piece(box.text[last:i], role), role)), None)
+        if cut is None:
+            return [box]
+        texts.append(piece(box.text[last:cut], role))
+        last = cut
+    role = role_at(kept[-2], kept[-1])
+    texts.append(piece(box.text[last:], role))
+    if not texts[-1] or not _fits_column(texts[-1], role):
+        return [box]
+    edges_x = [box.x0, *((at + left_px) / width for at in kept[1:-1]), box.x1]
+    return [replace(box, text=text, x0=a, x1=b) for text, a, b in zip(texts, edges_x, edges_x[1:])]
+
+
 def _license(text):
     # NFKC turns full-width OCR punctuation ("：AH515423") into ASCII before stripping it.
     code = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text).upper()).strip(".,:;")
@@ -272,6 +389,8 @@ def _read_rows(boxes, columns, start, end, grid, page_number):
     register_index = roles.index("register_index") if "register_index" in roles else None
     license_index = roles.index("license_number") if roles.count("license_number") == 1 else None
     boxes = [b for b in boxes if start <= b.y < end and columns[0]["left"] <= b.x < columns[-1]["right"]]
+    boxes = [part for box in boxes for part in _cut_at_rules(box, columns, grid, [
+        other for other in boxes if other is not box and abs(other.y - box.y) < (box.y1 - box.y0) / 2])]
     def list_continues_below(marker):
         # OCR drops accents, so a wrapped name ending in "Công" reads like a "Cộng" total.
         return any(b.y > marker.y1 and (_license(b.text) or (
@@ -510,6 +629,8 @@ def _recover_missing_columns(rows, columns):
                 reg_str = m_merged.group(2)
                 name_str = f"{m_merged.group(3)} {c_name}"
                 guessed = True
+            elif re.fullmatch(r"[0-9]{5,10}", c0):
+                reg_str = c0  # a register code cut from the name at the printed rule is not an STT
             else:
                 m_stt = _RE_STT.match(c0)
                 stt_str = m_stt.group(1) if m_stt else c0
@@ -598,8 +719,70 @@ def _recover_missing_columns(rows, columns):
         return
 
 
+_YEAR = r"(?:19|20)[0-9]{2}"
+_RE_BIRTH = re.compile(rf"(?<![0-9])(?:{_YEAR}|[0-9]{{1,2}}[/.\-][0-9]{{1,2}}[/.\-][0-9]{{2,4}})(?![0-9])")
+_RE_LEADING_YEAR = re.compile(rf"^\s*({_YEAR})(?![0-9])[\s,.;:\-]*(.*)$", re.S)
+_NATION = r"vi[eêệếề]t\s*nam"
+_RE_NATION_ONLY = re.compile(rf"^\s*({_NATION})[\s:;.,]*$", re.I)
+_RE_NATION_FIRST = re.compile(rf"^\s*({_NATION})(?![A-Za-zÀ-ỹ])[\s:;.,]*(.*)$", re.I | re.S)
+_RE_NATION_LAST = re.compile(rf"^(.*?)[\s,;\-]*(?<![A-Za-zÀ-ỹ])({_NATION})[\s:;.,]*$", re.I | re.S)
+# Hạng after the number, OCR reading "1" as "l"/"I"/"|": "AG982436 A1", "AG983278A1", "A&9826 Al".
+_RE_CLASS_AFTER = re.compile(
+    r"^(.*?[0-9])\s*(A[1-4lI|]|B[12lI|])$|^(.*\S)\s+(A[1-4lI|]|B[12lI|]|C|D|E|F[BCDE]?)$", re.S)
+
+
+def _move(row, source, target, text, before=False):
+    """Put text read into the wrong cell into its own cell; the cell keeps the lower OCR score."""
+    cells = row["cells"]
+    cells[target] = (f"{text} {cells[target]}" if before else f"{cells[target]} {text}").strip()
+    scores = row.get("scores")
+    if scores and max(source, target) < len(scores):
+        scores[target] = min(scores[target], scores[source])
+
+
+def _return_shifted_cells(rows, columns):
+    """Values OCR put in the next cell go back to their own column, told apart by what they hold.
+
+    A typed list read across its cell borders (or with column edges that miss the printed cells)
+    puts the birth year at the start of the address, "Việt Nam" before the GPLX number and the
+    licence class after it, and the end of a wrapped address in the birth column. Only a cell that
+    lacks its own kind of value takes one back, so cells already in place are not changed.
+    """
+    roles = [c.get("role") for c in columns]
+    index = {role: roles.index(role) for role in set(roles) if roles.count(role) == 1}
+    birth, address = index.get("birth_year"), index.get("address")
+    nation, number, grade = index.get("nationality"), index.get("license_number"), index.get("license_class")
+    for row in rows:
+        cells = row["cells"]
+        if birth is not None and address == birth + 1:
+            if not _RE_BIRTH.search(cells[birth]) and (lead := _RE_LEADING_YEAR.match(cells[address])):
+                cells[address] = lead[2].strip()
+                _move(row, address, birth, lead[1], before=True)
+            if found := _RE_BIRTH.search(cells[birth]):
+                rest = (cells[birth][:found.start()] + " " + cells[birth][found.end():]).strip(" ,.;:-")
+                if re.search(r"[A-Za-zÀ-ỹ]{2}", rest):  # the end of the address wrapped under the birth year
+                    cells[birth] = found[0]
+                    _move(row, birth, address, rest)
+        if nation is not None:
+            if only := _RE_NATION_ONLY.match(cells[nation]):
+                cells[nation] = only[1]
+            if number == nation + 1 and (first := _RE_NATION_FIRST.match(cells[number])):
+                cells[number] = first[2].strip()
+                if not cells[nation]:
+                    _move(row, number, nation, first[1])
+            elif address == nation - 1 and not cells[nation] and (last := _RE_NATION_LAST.match(cells[address])):
+                cells[address] = last[1].strip()
+                _move(row, address, nation, last[2])
+        if number is not None and grade is not None and not cells[grade].strip() and not _license(cells[number]):
+            if after := _RE_CLASS_AFTER.match(cells[number].strip()):
+                rest, value = (after[1], after[2]) if after[1] is not None else (after[3], after[4])
+                cells[number] = rest.strip()
+                _move(row, number, grade, re.sub(r"[lI|]", "1", value))
+
+
 def _finish_rows(rows, columns, grid):
     _recover_missing_columns(rows, columns)
+    _return_shifted_cells(rows, columns)
     roles = [c["role"] for c in columns]
     valid_columns = [i for i, role in enumerate(roles) if role == "license_number"]
     inferred = False
@@ -829,3 +1012,186 @@ def table_citizens(table):
         citizen["license_state"] = row["license_state"]
         citizens.append(citizen)
     return citizens
+
+
+def _edit_distance(a, b):
+    previous = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        current = [i]
+        for j, y in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (x != y)))
+        previous = current
+    return previous[-1]
+
+
+def suggest_license_numbers(table):
+    """{row index: GPLX number} the neighbours of a row point to, for numbers OCR read wrong.
+
+    The numbers of one list usually run on by one. A number counts as known when it is valid and
+    follows on from the nearest known number before or after it. A row between two known numbers
+    that agree with the rows between them (same letters, the difference equals the row distance)
+    gets the number of its place, also when OCR read a valid but different number there. A row
+    after or before the last known number, or next to a break, gets one only when its text is
+    close to it (at most 2 characters differ) and closer than to the other side's. Blank cells, cells the user checked and real breaks are left as they are.
+    These are suggestions: nothing is changed until the user accepts them.
+    """
+    roles = [c["role"] for c in table["columns"]]
+    if roles.count("license_number") != 1:
+        return {}
+    column = roles.index("license_number")
+    rows = table["rows"]
+    known = {}
+    for i, row in enumerate(rows):
+        if row.get("license_state") == "valid" and row.get("license_number"):
+            prefix, number, width = split_prefix_and_num(row["license_number"])
+            if number >= 0:
+                known[i] = (prefix, number, width)
+
+    def follows(a, b):
+        return known[a][0] == known[b][0] and known[b][1] - known[a][1] == b - a
+
+    def number_at(anchor, i):
+        prefix, number, width = known[anchor]
+        value = number + i - anchor
+        return f"{prefix}{value:0{width}d}" if value >= 0 else None
+
+    order = sorted(known)
+    trusted = [i for k, i in enumerate(order)
+               if (k and follows(order[k - 1], i)) or (k + 1 < len(order) and follows(i, order[k + 1]))]
+    suggestions = {}
+    for i, row in enumerate(rows):
+        if i in trusted or row.get("_edited") or row.get("license_state") == "blank":
+            continue
+        before = max((j for j in trusted if j < i), default=None)
+        after = min((j for j in trusted if j > i), default=None)
+        expected = None
+        if before is not None and after is not None and follows(before, after):
+            expected = number_at(before, i)
+        elif row.get("license_state") != "valid":
+            # One side only, or a break between the sides (two lists shown as one): the side whose
+            # number the text is closest to, when no other side fits as well.
+            text = re.sub(r"\s+", "", str(row["cells"][column])).upper()
+            guesses = {number_at(anchor, i) for anchor in (before, after) if anchor is not None} - {None}
+            close = sorted((_edit_distance(text, guess), guess) for guess in guesses if text)
+            close = [pair for pair in close if pair[0] <= 2]
+            read = _license(text)
+            if close and (len(close) == 1 or close[0][0] < close[1][0]) and (not read or read == close[0][1]):
+                expected = close[0][1]  # a number read clearly is only confirmed, not replaced
+        if expected and expected != row.get("license_number"):
+            suggestions[i] = expected
+    return suggestions
+
+
+def _placed_columns(tables):
+    """Match the columns of the lists by where they are printed on the page.
+
+    One book's lists share one printed layout, while OCR reads its headings differently from
+    page to page ("Ký nhận", "KY" + "NHAN", "ANH 3 X 4", "ANH" + "X4"). The list read with the
+    most named columns is the frame; every other column joins the frame column it overlaps most
+    (at least half the narrower width) unless both have different named roles, or else the one
+    frame column of its named role. A frame column read as
+    plain text takes the role another page read for it. Anything else is a column of its own.
+    Returns the frame columns in page order and, per list, the frame index of each column.
+    """
+    def named(table):
+        return sum(column["role"] != "other" for column in table["columns"])
+
+    frame_table = max(tables, key=lambda table: (named(table), -len(table["columns"])))
+    frame = [dict(column) for column in frame_table["columns"]]
+    places = {id(frame_table): list(range(len(frame)))}
+    for table in tables:
+        if table is frame_table:
+            continue
+        own = []
+        for column in table["columns"]:
+            best, best_overlap = None, .5
+            for index, target in enumerate(frame):
+                if "other" not in (column["role"], target["role"]) and column["role"] != target["role"]:
+                    continue
+                width = max(min(column["right"] - column["left"], target["right"] - target["left"]), 1e-6)
+                overlap = (min(column["right"], target["right"]) - max(column["left"], target["left"])) / width
+                rank = (overlap, target["role"] == column["role"])
+                if overlap >= .5 and (best is None or rank > best_overlap):
+                    best, best_overlap = index, rank
+            same = [index for index, target in enumerate(frame)
+                    if column["role"] != "other" and target["role"] == column["role"]]
+            if best is None and len(same) == 1 and same[0] not in own:
+                best = same[0]  # one column per role in a book, wherever OCR placed its heading
+            if best is None:
+                frame.append(dict(column, _added=True))
+                best = len(frame) - 1
+            elif frame[best]["role"] == "other" and column["role"] != "other" and not any(
+                    target["role"] == column["role"] for target in frame):
+                frame[best].update(label=column["label"], role=column["role"])
+            own.append(best)
+        places[id(table)] = own
+    order = sorted(range(len(frame)), key=lambda i: (frame[i]["left"], bool(frame[i].get("_added"))))
+    rank = {old: new for new, old in enumerate(order)}
+    columns = [{k: v for k, v in frame[i].items() if k not in ("left", "right", "_added")} for i in order]
+    return columns, {key: [rank[i] for i in own] for key, own in places.items()}
+
+
+def _named_columns(tables):
+    """Match the columns of the lists by role (a plain-text heading by its text) when positions are unknown."""
+    def keys(columns):
+        seen, out = {}, []
+        for column in columns:
+            base = column["role"] if column["role"] != "other" else "other:" + _key(column.get("label", ""))
+            out.append((base, seen.get(base, 0)))
+            seen[base] = seen.get(base, 0) + 1
+        return out
+
+    union, columns = [], []
+    for table in tables:
+        own = keys(table["columns"])
+        for i, key in enumerate(own):
+            if key in union:
+                continue
+            at = union.index(own[i - 1]) + 1 if i and own[i - 1] in union else (0 if i == 0 else len(union))
+            union.insert(at, key)
+            columns.insert(at, {k: v for k, v in table["columns"][i].items() if k not in ("left", "right")})
+    return columns, {id(table): [union.index(key) for key in keys(table["columns"])] for table in tables}
+
+
+def merge_tables(tables):
+    """The lists of one PDF as one list: one dossier is reviewed and saved as one list (one Excel sheet).
+
+    Columns are matched by printed position when known (`_placed_columns`), else by role. Rows keep
+    their page order; a cell a list does not have is empty (its index is in the row's
+    "absent_columns"); cells of one list that fall in one column are joined. Pages to check are kept.
+    The lists given are not changed.
+    """
+    tables = [table for table in tables if table.get("rows")]
+    if len(tables) <= 1:
+        return [{**table, "columns": [dict(c) for c in table["columns"]]} for table in tables]
+    placed = all("left" in column and "right" in column for table in tables for column in table["columns"])
+    columns, places = (_placed_columns if placed else _named_columns)(tables)
+    rows, pages = [], set()
+    for table in tables:
+        own = places[id(table)]
+        pages.update(table.get("unresolved_pages", []))
+        for row in table["rows"]:
+            merged = dict(row)
+            parts = [[] for _ in columns]
+            for index, place in enumerate(own):
+                parts[place].append(index)
+            if "cells" in row:
+                merged["cells"] = [" ".join(row["cells"][i] for i in part if i < len(row["cells"]) and row["cells"][i])
+                                   for part in parts]
+            if "scores" in row:
+                merged["scores"] = [min((row["scores"][i] for i in part if i < len(row["scores"])), default=1.0)
+                                    for part in parts]
+            if "bounds" in row:
+                boxes = [[row["bounds"][i] for i in part if i < len(row["bounds"]) and row["bounds"][i]] for part in parts]
+                merged["bounds"] = [(min(b[0] for b in found), min(b[1] for b in found), max(b[2] for b in found),
+                                     max(b[3] for b in found)) if found else None for found in boxes]
+            absent = [place for place, part in enumerate(parts) if not part]
+            if absent:
+                merged["absent_columns"] = absent  # columns this row's list does not have
+            else:
+                merged.pop("absent_columns", None)
+            rows.append(merged)
+    merged_table = {"columns": columns, "rows": rows}
+    if pages:
+        merged_table["unresolved_pages"] = sorted(pages)
+    return [merged_table]

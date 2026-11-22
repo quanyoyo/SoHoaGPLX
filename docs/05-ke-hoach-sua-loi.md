@@ -295,3 +295,85 @@ Bổ sung 22/11/2026 (2) (theo yêu cầu chủ dự án):
 - Tổng số GPLX tự điền bằng số dòng OCR đọc được ở mọi danh sách, kể cả khi còn dòng hoặc trang chưa rõ (trước đó để trống). Nhận định vẫn "Cần rà soát" nếu chưa chắc. Mẫu `15.SQL.03.1996` (10 danh sách): 127.
 - Kiểm tra giá trị gõ: Ngày thi/sát hạch dạng `dd-mm-yyyy` và là ngày có thật; Số GPLX đầu/cuối (nhóm SQL) viết hoa, 1–2 chữ cái + 6 chữ số liền nhau. Ngày thi do máy đọc tự đổi sang `dd-mm-yyyy`. `typed_format_errors`, `format_exam_date` (`src/naming_rules.py`); test `test_exam_dates_read_by_the_machine_are_written_dd_mm_yyyy`, `test_typed_exam_date_and_sql_endpoints_must_be_in_the_stored_form`, `test_an_exam_date_read_by_the_machine_is_shown_dd_mm_yyyy`, `test_a_typed_exam_date_must_be_dd_mm_yyyy`, `test_typed_gplx_endpoints_must_be_upper_case`.
 
+## 18. Kế hoạch: danh sách "Đã xong", xem hồ sơ đã lưu không OCR, cập nhật sổ tổng hợp từ Excel, bỏ ô "Dãy số GPLX" (22/11/2026 — đã làm, kết quả cuối mục)
+
+Hiện trạng (theo code):
+- Bấm file "Xong" trong hàng đợi thì app OCR lại (`src/gui/app.py` `on_file_selected`, trạng thái `COMPLETED`).
+- Xác nhận thì ghi PDF, Excel, sổ tổng hợp, CSDL cùng lúc. "Quét lại từ Excel" chỉ đọc Excel vào CSDL (thông tin bìa, dãy số, nhận định lấy từ sheet ẩn `_GPLX`, là giá trị lúc lưu), không ghi sổ tổng hợp.
+- Ô "Dãy số GPLX" ghi vào cột 9 "Số GPLX trong file" của sổ tổng hợp, CSDL và cột "Dãy số GPLX" ở tab Tra cứu.
+
+Hướng đã chốt (cách B): xác nhận vẫn ghi sổ tổng hợp ngay; sửa Excel xong thì bấm "Cập nhật sổ tổng hợp từ Excel" để tính lại và ghi đè đúng dòng đó.
+
+| Bước | Việc | Cách làm | Test (viết trước) |
+|---|---|---|---|
+| 1 | Bỏ ô "Dãy số GPLX" ở khung Rà soát | Xóa ô và nhãn. Khi lưu, dãy số lấy từ kết quả tính (`summarize_license_tables`), không bắt nhập (`_missing_fields` bỏ "Dãy số GPLX"). Luồng đổi tên nhanh vẫn ghi `Đầu X · Cuối Y`. Danh sách còn ô chưa rõ thì cột 9 để trống cho tới khi cập nhật từ Excel. | Lưu sổ đủ số: cột 9 có dãy; sổ còn ô trống: cột 9 trống, vẫn lưu được; panel không còn ô dãy số. |
+| 2 | Đọc hồ sơ đã lưu, không OCR | Hàm mới `load_saved_dossier(pdf_path)` (`src/pipeline.py`). Luồng số hóa: đọc Excel cạnh PDF — thông tin bìa ở sheet ẩn `_GPLX`, mỗi sheet "Danh sách GPLX n" dựng lại bảng (tên cột ở dòng 5, vai trò cột ở dòng ẩn 4, cột "Trang PDF"); tổng số, dãy số, nhận định lấy từ dòng sổ tổng hợp. Luồng đổi tên nhanh: lấy từ dòng sổ tổng hợp và sheet đổi tên (nhóm, ngày thi). Không có Excel / Excel hỏng thì báo lỗi rõ. | Lưu một hồ sơ nhiều danh sách vào thư mục tạm rồi đọc lại: đủ thông tin bìa, đủ danh sách, đúng cột gốc, đúng trang; hồ sơ đổi tên nhanh; Excel thiếu/hỏng. |
+| 3 | Hàng đợi tách 2 danh sách | Nút chuyển phía trên danh sách file: "Đang xử lý (n)" · "Đã xong (n)". Lưu xong thì file chuyển sang "Đã xong", app nhảy tới file chờ kế tiếp như hiện nay. Mở thư mục thì file đã lưu nằm ở "Đã xong". "Đã duyệt x / y file" giữ nguyên. | Đếm và lọc đúng; lưu xong file chuyển danh sách; chọn file kế tiếp đúng. |
+| 4 | Xem file "Đã xong" | Bấm file trong "Đã xong": đọc bằng bước 2 trong luồng nền (không khóa giao diện), panel ở chế độ **chỉ xem** (ô nhập khóa, bảng không sửa được), có 3 nút: "Mở file Excel", "Cập nhật sổ tổng hợp từ Excel" (chỉ luồng số hóa), "Sửa lại hồ sơ (đọc lại PDF)" (= cách làm hiện nay: OCR rồi sửa, lưu đè). | Bấm file đã xong không gọi OCR; ô bị khóa; nút "Sửa lại" mới gọi OCR. |
+| 5 | Cập nhật sổ tổng hợp từ Excel | Hàm mới `refresh_summary_from_excel(pdf_path)`: đọc Excel (dùng lại `_read_source_workbook`), tính tổng số = số dòng, dãy số và nhận định từ số GPLX trong Excel (`analyze_license_sequences`), ghi đè dòng sổ tổng hợp theo tên file (`update_or_append_summary_entry`; sổ đang mở thì báo như hiện nay), rồi cập nhật CSDL. Không ghi vào file Excel (người dùng có thể đang mở). "Quét lại từ Excel" cũng tính lại dãy số / nhận định từ dòng Excel thay vì sheet ẩn, để hai nơi khớp nhau. Nếu Excel đang mở (có file `~$…xlsx`) thì nhắc: chỉ phần đã bấm Lưu trong Excel được tính. | Sửa số GPLX / thêm, xóa dòng trong Excel rồi cập nhật: cột 8, 9, 11 đổi đúng, các cột khác giữ nguyên, CSDL tra cứu thấy số mới; sổ tổng hợp đang khóa; Excel còn ô trống. |
+| 6 | Hoàn tất | Cập nhật `02`, `03`, `04`, sổ tay; chạy đủ bộ test; thử trên cửa sổ thật (Scale 200%) với bản sao mẫu; build lại exe. | |
+
+Cần chủ dự án chốt trước khi làm:
+- (a) File "Đã xong" chỉ xem; muốn sửa thông tin bìa (hộp, hạng, mã tỉnh…) thì bấm "Sửa lại hồ sơ (đọc lại PDF)" như hiện nay. Đề xuất: đồng ý (tránh dựng lại Excel từ chính Excel).
+- (b) Excel còn ô số GPLX trống / sai dạng khi cập nhật: cột 9 ghi dãy của các số hợp lệ, nhận định "Cần rà soát". Đề xuất: đồng ý (hoặc để trống cột 9 tới khi Excel đủ số).
+- (c) Thêm nút "Cập nhật tất cả" cho mọi file trong "Đã xong" của thư mục đang mở. Đề xuất: có, làm sau nút từng file.
+
+Chủ dự án đã chốt cả 3 đề xuất (a), (b), (c). Kết quả (22/11/2026):
+
+| Bước | Đã làm | Test |
+|---|---|---|
+| 1 | Bỏ ô "Dãy số GPLX"; dãy số lấy từ `summarize_license_tables` khi lưu; `_missing_fields` không còn hỏi dãy số. | `test_the_sequence_is_computed_not_typed`, `test_every_box_must_be_filled_before_saving` |
+| 2 | `load_saved_dossier(pdf)` (`src/pipeline.py`): Excel cạnh PDF → bìa (`_GPLX`) + danh sách (`database.read_saved_tables`: cột theo dòng vai trò 4 và tên cột dòng 5, cột "Trang PDF"); dòng sổ tổng hợp (`_saved_summary_row`) → tổng số, dãy số, nhận định, hộp, hạng; mã tỉnh lấy từ tên sổ; nhóm, ngày thi của luồng B từ `_GPLX_Rename`. Không có dữ liệu / Excel hỏng → `ValueError` rõ ràng. | `SavedDossierTest` (`test_excel_v3.py`): đọc lại không OCR, đổi tên nhanh, PDF chưa lưu / Excel hỏng |
+| 3 | `BatchQueueFrame`: nút chuyển `view_switch` "Đang xử lý (n)" · "Đã xong (n)"; danh sách đang hiện lọc theo trạng thái `COMPLETED`; file đang mở luôn ở danh sách đang hiện (lưu xong thì chuyển sang "Đã xong"; "Sửa lại" thì về "Đang xử lý"). | `test_done_files_have_their_own_list`, `test_a_folder_of_saved_files_opens_on_the_done_list`, `test_status_change_updates_only_that_file` |
+| 4 | `on_file_selected`: file `COMPLETED` → `_load_saved_async` (luồng nền), không OCR. `ReviewPanel` chế độ chỉ xem (`saved_view`): khóa mọi ô, không sửa ô bảng, không lưu nháp, ẩn nút xác nhận, hiện 3 nút (luồng B chỉ có "Sửa lại"). Đọc lỗi → hỏi đọc lại PDF. | `test_a_saved_dossier_is_shown_read_only`, `test_a_saved_quick_rename_has_no_excel_buttons`, `test_clicking_a_done_file_shows_what_was_saved_without_ocr`, `test_saved_view_buttons` |
+| 5 | `refresh_summary_from_excel(pdf)` + `master_summary.update_summary_counts` (ghi cột 8, 9, 11, 12 của đúng một dòng) + CSDL; `sequence_analyzer.summarize_license_numbers` (số trống/sai dạng → "Cần rà soát"). `database.read_dossier_workbook` dùng chung cho "Quét lại từ Excel", nên quét lại cũng tính dãy số / nhận định từ dòng Excel. Nút "🔄 Cập nhật tất cả từ Excel" (chỉ hiện ở "Đã xong" của luồng A). Nhắc khi có file `~$…xlsx`. | `test_the_summary_follows_the_excel_edited_by_hand`, `test_an_excel_with_missing_numbers_needs_review`, `test_the_excel_rescan_also_follows_the_edited_rows`, `test_a_quick_rename_dossier_has_no_excel_to_update_from`, `test_refresh_all_sends_the_done_digitized_files`, `test_summaries_are_refreshed_from_the_excels_and_reported` |
+| 6 | Tài liệu `02`, `03`, `04`, sổ tay. Bộ test: 157 đạt, 1 bỏ qua. Cửa sổ thật Scale 200% (bản sao mẫu `QD_000493`, CSDL tạm): bấm file "Đã xong" không OCR (0 lần gọi), ô khóa, 3 nút không bị ép; sửa Excel (đổi 1 số, thêm 1 dòng chữ thường) rồi cập nhật → sổ tổng hợp 8 · `C244530; C244540; C244532-C244535; C244537-C244538` · "Ngắt, không theo thứ tự", CSDL khớp, khung Rà soát hiện số mới. Ở độ rộng tối thiểu 180 chữ nút "Cập nhật tất cả…" bị cắt nên đã rút gọn thành "🔄 Cập nhật tất cả từ Excel" (286 < 320). | |
+
+Chưa làm: ô "Tổng số GPLX" và "Nhận định" vẫn sửa được khi rà soát (lưu theo giá trị trong ô); sau khi cập nhật từ Excel thì sổ tổng hợp theo Excel.
+
+## 19. OCR đọc lệch cột và đọc sai số GPLX: cắt theo đường kẻ (A), chuyển theo nội dung (B), gợi ý số theo dãy (D) (22/11/2026 — đã làm)
+
+Ảnh chủ dự án gửi (một danh sách đánh máy, PDF không có trong mẫu `Tỉnh Yên Bái`): `1974 Xa ThinhHung…` nằm cả ở cột hộ khẩu, `Bai` (cuối địa chỉ) ở cột Năm sinh, `Viet Nam AG982436 A1` ở cột Số giấy phép; số GPLX đọc sai `A&9826`, `4G982441`, `AG98240`. Nguyên nhân (theo code): OCR trả một khung cho cả dòng chữ trùm qua đường kẻ; `_read_rows` đặt cả khung vào cột chứa điểm giữa của nó. Bảng ngắn hoặc đường kẻ mờ thì cạnh cột lấy theo khoảng giữa các tiêu đề, có thể lệch khỏi ô in.
+
+| Phần | Đã làm | Test |
+|---|---|---|
+| A | `_cut_at_rules`: cắt khung chữ tại đường kẻ in, vị trí cắt theo tỉ lệ mực từng ô (bỏ khoảng trắng quanh đường kẻ, bỏ mực dưới khung chữ khác của dòng), chỉ cắt ở khoảng trắng / chỗ chuyển số-chữ và chỉ khi mỗi mảnh hợp với cột của nó (`_fits_column`). Mảnh vào cột họ tên được tách chữ dính (`HaVanHai` → `Ha Van Hai`). `_recover_missing_columns` giữ mã 5–10 chữ số ở TT B.Kê. | `test_a_box_across_printed_rules_is_cut_at_the_rules`, `test_a_box_reaching_over_a_rule_without_ink_there_is_kept_whole` |
+| B | `_return_shifted_cells` (trong `_finish_rows`, trước khi xét số GPLX): năm sinh, phần địa chỉ lọt sang Năm sinh, "Việt Nam", hạng — chỉ chuyển vào ô còn thiếu loại giá trị đó. | `test_cells_shifted_into_the_next_column_go_back_by_what_they_hold` (đúng các dòng trong ảnh), `test_cells_already_in_place_are_not_moved` |
+| D | `suggest_license_numbers(table)`; khung Rà soát hiện `số → gợi ý?`, tô vàng, nút "✔ Nhận n số GPLX gợi ý" (`_accept_suggestions` dùng `apply_cell_edit`). Sửa tay một số GPLX thì tính lại gợi ý. | `LicenseSuggestionTest` (3), `test_gplx_numbers_the_neighbours_point_to_are_suggested_and_accepted_together`, `test_a_saved_dossier_has_no_suggestions_to_accept` |
+
+Đối chiếu trên OCR đã lưu của 10 PDF mẫu (821 dòng, không OCR lại; so code trước/sau từng ô):
+- 36 ô đổi, đều đúng: 14 dòng năm sinh dính đầu địa chỉ (cột Năm sinh trước trống) (`1986Phurong 17…` → `1986` | `Phurong 17…`); `QD_000493` dòng 25 trước rỗng họ tên, nay `201073` | `Do Dinh Tram` | `1955` | địa chỉ đủ; phần địa chỉ xuống dòng về đúng dòng 29; `SG_000116` p13 `4 i Hoang Tuan Hung` → STT `4`.
+- Dòng tô vàng 174 → 165; số GPLX hợp lệ 601 → 601; số dòng không đổi.
+- Lần đầu (chưa có `_fits_column`) có cắt sai (`134 CuA` | `Lu`, STT nhận mã `201052`); đã chặn bằng điều kiện mảnh phải hợp cột, chạy lại không còn.
+- Gợi ý: 18 gợi ý, cả 18 đúng (ô có `--` thừa hoặc đọc kém tin cậy, số gợi ý trùng số trên giấy); không có gợi ý sai.
+
+Giới hạn: bảng không nhận được đường kẻ (cạnh cột theo tiêu đề) thì A không chạy, chỉ B sửa được các loại giá trị đã biết (năm sinh, quốc tịch Việt Nam, hạng). Chưa thử trên PDF của ảnh (chưa có file); cần đường dẫn file để đối chiếu.
+
+## 20. Sửa Lỗi 33: khung ghi chú trống chiếm chỗ (22/11/2026 — đã làm)
+
+`_render_naming_lines` chỉ hiện khung ghi chú (`naming_notes_frame`) khi có dòng để hiện (lỗi đặt tên, lời nhắc khi chưa chọn file, ghi chú "Hồ sơ đã lưu: chỉ xem…"); không có thì ẩn khung, nên khung tên file không còn mảng trống. Khung hiện lại ngay dưới ô tên file khi có lỗi. Test: `test_the_empty_notes_box_takes_no_room`. Cửa sổ thật Scale 200%: khung "Tên file đề xuất" khi không có lỗi cao 152 điểm ảnh (trước 564).
+
+## 21. Gộp danh sách thành một cho mỗi PDF và ghép cột theo vị trí in trên giấy (22/11/2026 — đã làm)
+
+Yêu cầu và cải tiến: một file PDF chỉ có duy nhất một danh sách công dân hoàn chỉnh, tương ứng 1 sheet Excel và 1 bảng hiển thị ở màn hình rà soát, không để người dùng phải chọn qua lại giữa nhiều danh sách.
+
+| Nội dung | Cách làm & Chi tiết | Test |
+|---|---|---|
+| Một danh sách cho mỗi PDF | Khi đọc PDF (`pipeline.process_dossier_pdf`, `table_extractor.merge_tables_for_book`), máy gộp mọi bảng thành 1 danh sách duy nhất. File Excel con xuất ra (`generate_excel_companion`) chỉ có đúng 1 sheet `"Danh sách GPLX"`. Khi mở lại hồ sơ đã lưu (`load_saved_dossier`), máy đọc 1 sheet này. File Excel cũ đã lưu nhiều sheet trước đây vẫn mở được bình thường (tự động gộp khi đọc). Ô chọn thả xuống "Đang xem (n danh sách)" tự ẩn khi chỉ có 1 danh sách. | `test_excel_v3.py`, `test_license_tables_v3.py`, `test_folder_review_v3.py` |
+| Ghép cột theo vị trí in trên giấy | OCR đọc tiêu đề mỗi trang một kiểu ("Ký nhận" / "KY" + "NHAN", "Quốc tịch" / "QUOC" + "TICH"). Thay vì chỉ so sánh chuỗi tên cột (từng khiến bảng bị bung ra tới 14 cột), máy so sánh vị trí tương đối của cột trên trang giấy (`bbox` / khoảng tọa độ ngang) để nhận diện các cột nằm cùng vị trí in là cùng một cột, đồng thời tự động ghép chữ lại khi một cột bị OCR tách làm đôi. Kết quả: trên 10 PDF mẫu, số cột giảm gọn về 8–10 cột chuẩn (tối đa 11–13 cột nếu có cột ảnh/chữ ký riêng). | `test_license_tables_v3.py` |
+| Bỏ cảnh báo đối chiếu ảnh thừa | Dòng của danh sách không có cột ảnh/chữ ký không còn bị ghi chú "Cần đối chiếu ảnh" một cách không cần thiết. | `test_license_tables_v3.py` |
+| Gợi ý số GPLX ở ranh giới nối danh sách | Trước đây khi chuyển giữa các danh sách, số ở ranh giới bị ngắt quãng nên mất gợi ý; nay máy tính toán dãy số qua điểm nối và dựa vào bên có số gần giống hơn để đưa ra gợi ý liên tục. Tổng số gợi ý trên 10 PDF mẫu tăng từ 18 lên 24 gợi ý chính xác. | `LicenseSuggestionTest` |
+| Sửa lỗi 2 cột "ANH" | Khắc phục hiện tượng xuất hiện 2 cột ảnh do khác biệt nhãn giữa các trang. | `test_license_tables_v3.py` |
+| Sửa lỗi gợi ý sai C244481 → C244482 | Do dòng bên cạnh chứa 2 số dính nhau (`C244482 C244483`) nên đếm theo dòng bị lệch 1. Đã sửa: số GPLX đã đọc rõ ràng, hợp lệ chỉ được xác nhận độ tin cậy, không bị thay thế bằng số khác. | `test_license_tables_v3.py` |
+
+### Kết quả đối chiếu trên 10 PDF mẫu sau 2 lần sửa cuối (`eval_merge.py`):
+- **Tóm tắt không đổi**: Số GPLX đầu/cuối, tổng số dòng (821 dòng), dãy số GPLX và nhận định trên cả 10 PDF mẫu hoàn toàn giống hệt trước khi gộp.
+- **24 gợi ý số GPLX**: Đã kiểm tra từng gợi ý trên cả 10 PDF, tất cả 24 gợi ý đều chính xác 100%, không có gợi ý sai nào:
+  - `A465243–A465245` trong `H38.8.4_SG_000116_V1_20260425_000005.pdf` (trang 11): dòng 29 (`A465243`), dòng 30 (`A465244`) được xác nhận theo dãy, dòng 31 (`-- A465245` -> gợi ý sạch bỏ nét gạch thừa thành `A465245`). Cả 3 số khớp chính xác dãy tăng liên tục `A465241..A465251` qua các trang 10–13.
+  - `A465658 CL2` trong `H38.8.4_SG_000116_V1_20260425_000007.pdf` (trang 6, dòng 12): lọc sạch phần chữ nhiễu `'CL2'` phía sau số bằng lái thành gợi ý `A465658`, nằm liền giữa `A465657` và `A465659`.
+  - Dòng 63 trang 30 của cùng file `000007`: gợi ý làm sạch dấu `--` (`-- C244835` → `C244835`).
+  - File `15.SQL.03.1996.C244337-C244498.pdf` / `000003.pdf`: 8 gợi ý làm sạch dấu `--`, xác nhận `C244484` sau dòng dính `C244482 C244483` mà không đổi sai `C244481`.
+  - File `000006.pdf`: 3 gợi ý làm sạch dấu `--` (`C244628`, `C244658`, `C244738`).
+- **Bộ test**: 173 test đạt (1 test bỏ qua).
+
+
